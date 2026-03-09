@@ -1,0 +1,28 @@
+[package]
+name = "openixcli"
+version = "0.1.0"
+edition = "2021"
+description = "Firmware flashing CLI tool for Allwinner chips"
+license = "MIT"
+authors = ["OpenixSuit Team"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2.0"
+anyhow = "1.0"
+indicatif = "0.17"
+colored = "3.0"
+byteorder = "1.5"
+memmap2 = "0.9"
+chrono = "0.4"
+once_cell = "1.19"
+
+[dependencies.libefex]
+git = "https://github.com/YuzukiTsuru/libefex"
+
+[[bin]]
+name = "openixcli"
+path = "src/main.rs"
