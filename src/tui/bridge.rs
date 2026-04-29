@@ -138,6 +138,8 @@ pub async fn run_flash(
         mode: flash_mode,
         partitions,
         post_action: post_action.clone(),
+        reconnect_timeout_sec: 90,
+        reconnect_interval_ms: 500,
     };
 
     let _ = tx.send(AppEvent::LogMessage(

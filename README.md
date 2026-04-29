@@ -16,6 +16,7 @@ OpenixCLI is a powerful and user-friendly CLI tool designed for flashing firmwar
 - **Device Scanning**: Automatically detect connected Allwinner devices
 - **Firmware Flashing**: Flash firmware images with multiple modes
 - **FEL/FES Support**: Handles both FEL (USB Boot) and FES (U-Boot) device modes
+- **FES Retry Guard**: Auto retry once when first FES handshake fails after FEL->FES transition
 - **Verification**: Optional write verification for data integrity
 - **Progress Tracking**: Visual progress indicators during flash operations
 - **Partition Selection**: Flash specific partitions or entire firmware
@@ -66,6 +67,8 @@ openixcli flash <firmware_file> [options]
 | `--mode` | `-m` | Flash mode: `partition`, `keep_data`, `partition_erase`, `full_erase` (default: full_erase) |
 | `--partitions` | `-p` | Comma-separated list of partitions to flash |
 | `--post-action` | `-a` | Post-flash action: `reboot`, `poweroff`, `shutdown` (default: reboot) |
+| `--reconnect-timeout-sec` |  | Reconnect timeout seconds after FEL->FES handoff (default: 90) |
+| `--reconnect-interval-ms` |  | Reconnect polling interval milliseconds (default: 500) |
 | `--verbose` | `-v` | Enable verbose output |
 
 #### Flash Examples
@@ -92,6 +95,12 @@ Flash and power off after completion:
 
 ```bash
 openixcli flash firmware.img --post-action poweroff
+```
+
+When USB reconnect is slow in VM passthrough (e.g. VMware), increase reconnect wait:
+
+```bash
+openixcli flash firmware.img --reconnect-timeout-sec 180 --reconnect-interval-ms 300
 ```
 
 ## Flash Modes

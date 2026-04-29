@@ -24,6 +24,8 @@ pub struct FlashArgs {
     pub mode: FlashMode,
     pub partitions: Option<Vec<String>>,
     pub post_action: String,
+    pub reconnect_timeout_sec: u64,
+    pub reconnect_interval_ms: u64,
     pub verbose: bool,
 }
 

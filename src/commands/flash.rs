@@ -44,6 +44,10 @@ pub async fn execute(args: FlashArgs) -> anyhow::Result<()> {
     } else {
         logger.info("No device specified, will use first available device");
     }
+    logger.info(&format!(
+        "Reconnect wait: {}s, poll {}ms",
+        args.reconnect_timeout_sec, args.reconnect_interval_ms
+    ));
 
     let options = FlashOptions {
         bus: args.bus,
@@ -57,6 +61,8 @@ pub async fn execute(args: FlashArgs) -> anyhow::Result<()> {
         },
         partitions: args.partitions,
         post_action: args.post_action,
+        reconnect_timeout_sec: args.reconnect_timeout_sec,
+        reconnect_interval_ms: args.reconnect_interval_ms,
     };
 
     let mut flasher = Flasher::new(packer, options, logger.clone());

@@ -71,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
             mode,
             partitions,
             post_action,
+            reconnect_timeout_sec,
+            reconnect_interval_ms,
         }) => {
             setup_logging(cli.verbose);
 
@@ -88,6 +90,8 @@ async fn main() -> anyhow::Result<()> {
                 mode: flash_mode,
                 partitions: partition_list,
                 post_action,
+                reconnect_timeout_sec,
+                reconnect_interval_ms,
                 verbose: cli.verbose,
             };
 

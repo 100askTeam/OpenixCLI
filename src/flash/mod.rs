@@ -59,6 +59,8 @@ pub struct FlashOptions {
     pub mode: FlashMode,
     pub partitions: Option<Vec<String>>,
     pub post_action: String,
+    pub reconnect_timeout_sec: u64,
+    pub reconnect_interval_ms: u64,
 }
 
 /// Main flash controller
@@ -177,10 +179,23 @@ impl Flasher {
         }
 
         let mut fes_handler = FesHandler::new(&mut self.logger);
+        let fes_result = fes_handler.handle(&ctx, &mut self.packer, &self.options).await;
+        if let Err(first_err) = fes_result {
+            if has_fel && Self::is_retryable_fes_error(&first_err) {
+                self.logger.warn(&format!(
+                    "FES first handshake failed: {}. Reconnecting and retrying once...",
+                    first_err
+                ));
+                self.logger.begin_stage(StageType::FelReconnect);
+                ctx = self.reconnect_device().await?;
+                self.logger.complete_stage();
 
-        fes_handler
-            .handle(&ctx, &mut self.packer, &self.options)
-            .await?;
+                let mut retry_handler = FesHandler::new(&mut self.logger);
+                retry_handler.handle(&ctx, &mut self.packer, &self.options).await?;
+            } else {
+                return Err(first_err);
+            }
+        }
 
         self.logger.finish_progress();
 
@@ -195,20 +210,21 @@ impl Flasher {
     /// Reconnect to device after FEL mode operations
     async fn reconnect_device(&self) -> FlashResult<libefex::Context> {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(self.options.reconnect_timeout_sec);
+        let mut attempts: u64 = 0;
+        let interval = tokio::time::Duration::from_millis(self.options.reconnect_interval_ms);
 
-        let max_retries = 25;
-        let mut retries = 0;
-
-        while retries < max_retries {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(interval).await;
+            attempts += 1;
 
             let devices = match libefex::Context::scan_usb_devices() {
                 Ok(d) => d,
                 Err(_) => {
-                    retries += 1;
                     self.logger.debug(&format!(
-                        "Reconnect attempt {}/{} (scan failed)",
-                        retries, max_retries
+                        "Reconnect attempt {} (scan failed)",
+                        attempts
                     ));
                     continue;
                 }
@@ -223,21 +239,22 @@ impl Flasher {
                     continue;
                 }
                 if new_ctx.efex_init().is_err() {
+                    self.logger.debug(&format!(
+                        "Reconnect attempt {}: efex init failed at bus {}, port {}",
+                        attempts, dev.bus, dev.port
+                    ));
                     continue;
                 }
 
-                if new_ctx.get_device_mode() == libefex::DeviceMode::Srv {
-                    self.logger.debug(&format!(
-                        "Device found at bus {}, port {}",
-                        dev.bus, dev.port
-                    ));
+                let mode = new_ctx.get_device_mode();
+                self.logger.debug(&format!(
+                    "Reconnect attempt {}: bus {}, port {}, mode {:?}",
+                    attempts, dev.bus, dev.port, mode
+                ));
+                if mode == libefex::DeviceMode::Srv {
                     return Ok(new_ctx);
-                }
+                } 
             }
-
-            retries += 1;
-            self.logger
-                .debug(&format!("Reconnect attempt {}/{}", retries, max_retries));
         }
 
         Err(FlashError::ReconnectFailed)
@@ -256,5 +273,12 @@ impl Flasher {
             .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
 
         Ok(())
+    }
+
+    fn is_retryable_fes_error(err: &FlashError) -> bool {
+        matches!(
+            err,
+            FlashError::UsbTransferError(_) | FlashError::DeviceOpenFailed(_)
+        )
     }
 }

@@ -84,6 +84,22 @@ pub enum Commands {
             help = "Post-flash action: reboot, poweroff, shutdown"
         )]
         post_action: String,
+
+        /// Device reconnect timeout in seconds after U-Boot handoff
+        #[arg(
+            long,
+            default_value_t = 90u64,
+            help = "Reconnect timeout seconds after FEL->FES transition"
+        )]
+        reconnect_timeout_sec: u64,
+
+        /// Poll interval in milliseconds while waiting device reconnect
+        #[arg(
+            long,
+            default_value_t = 500u64,
+            help = "Reconnect polling interval in milliseconds"
+        )]
+        reconnect_interval_ms: u64,
     },
 
     /// Launch interactive TUI mode
