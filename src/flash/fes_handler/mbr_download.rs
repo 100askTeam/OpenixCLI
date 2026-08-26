@@ -10,6 +10,7 @@ use std::time::Duration;
 
 /// Maximum number of verification retries
 const MAX_VERIFY_RETRIES: usize = 5;
+const MAX_DOWNLOAD_RETRIES: usize = 5;
 
 /// MBR download handler
 ///
@@ -35,8 +36,29 @@ impl<'a> MbrDownload<'a> {
             return Err(FlashError::InvalidFirmwareFormat("Invalid MBR".to_string()));
         }
 
-        ctx.fes_down(mbr_data, 0, FesDataType::Mbr)
-            .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
+        let mut last_error = None;
+        for attempt in 1..=MAX_DOWNLOAD_RETRIES {
+            match ctx.fes_down(mbr_data, 0, FesDataType::Mbr) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(libefex::EfexError::FesStatus(status)) if attempt < MAX_DOWNLOAD_RETRIES => {
+                    self.logger.warn(&format!(
+                        "RAW_MBR_DOWNLOAD_RETRY:attempt={attempt},status=0x{status:02x}"
+                    ));
+                    last_error = Some(libefex::EfexError::FesStatus(status));
+                    tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(FlashError::UsbTransferError(error.to_string()));
+        }
 
         self.verify_mbr(ctx).await
     }
@@ -56,8 +78,8 @@ impl<'a> MbrDownload<'a> {
             }
         }
 
-        self.logger
-            .warn("MBR verification not confirmed, continuing...");
-        Ok(())
+        Err(FlashError::Unknown(
+            "RAW_MBR_VERIFY_FAILED: FES did not confirm the generated Allwinner MBR".to_owned(),
+        ))
     }
 }

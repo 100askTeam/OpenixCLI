@@ -33,6 +33,16 @@ pub enum FlashEvent {
         total: u64,
         speed: f64,
     },
+    Verification {
+        status: &'static str,
+        error_code: Option<i32>,
+    },
+    PostAction {
+        action: PostAction,
+        status: &'static str,
+        attempt: u32,
+        error: Option<String>,
+    },
     Finished {
         post_action: PostAction,
     },

@@ -57,7 +57,17 @@ impl<'a> BootDownload<'a> {
         if let Some((maintype, subtype)) = self.get_boot1_subtype(secure, storage_type) {
             self.logger
                 .debug(&format!("Looking for Boot1: {}/{}", maintype, subtype));
-            match packer.get_file_data_by_maintype_subtype(maintype, subtype) {
+            // A mainline NAND component package intentionally carries a
+            // legacy `u-boot.fex` rather than Tina's combined boot_package.
+            // The board-matched FES loader accepts that image through the
+            // normal Boot1 tag, so fall back to the explicit U-Boot component
+            // when a package-mode target has no BOOTPKG entry.
+            let boot1_data = packer
+                .get_file_data_by_maintype_subtype(maintype, subtype)
+                .or_else(|_| {
+                    packer.get_file_data_by_maintype_subtype("12345678", "UBOOT_0000000000")
+                });
+            match boot1_data {
                 Ok(boot1_data) => {
                     self.logger.info(&format!(
                         "Downloading Boot1: {}/{} ({} bytes)",
@@ -139,13 +149,8 @@ impl<'a> BootDownload<'a> {
             .fes_verify_status(data_type)
             .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
 
-        if verify.flag == EFEX_CRC32_VALID_FLAG {
-            self.logger.stage_complete(&format!("{} verified", name));
-        } else {
-            self.logger
-                .warn(&format!("{} verify status: 0x{:04x}", name, verify.flag));
-        }
-
+        validate_boot_verification(name, verify.flag)?;
+        self.logger.stage_complete(&format!("{} verified", name));
         Ok(())
     }
 
@@ -191,5 +196,28 @@ impl<'a> BootDownload<'a> {
                 _ => Some("TOC0_00000000000"),
             }
         }
+    }
+}
+
+fn validate_boot_verification(name: &str, flag: u32) -> FlashResult<()> {
+    if flag != EFEX_CRC32_VALID_FLAG {
+        return Err(FlashError::PartitionDownloadFailed(format!(
+            "BOOT_COMPONENT_VERIFY_STATUS_INVALID:name={name}:flag=0x{flag:04x}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_component_verification_is_strict() {
+        assert!(validate_boot_verification("Boot0", EFEX_CRC32_VALID_FLAG).is_ok());
+        assert!(validate_boot_verification("Boot1", 0)
+            .unwrap_err()
+            .to_string()
+            .contains("BOOT_COMPONENT_VERIFY_STATUS_INVALID"));
     }
 }

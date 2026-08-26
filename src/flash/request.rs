@@ -86,6 +86,7 @@ pub enum PostAction {
     Reboot,
     PowerOff,
     Shutdown,
+    None,
 }
 
 impl PostAction {
@@ -94,6 +95,7 @@ impl PostAction {
             PostAction::Reboot => "Reboot",
             PostAction::PowerOff => "Power Off",
             PostAction::Shutdown => "Shutdown",
+            PostAction::None => "None",
         }
     }
 
@@ -102,6 +104,7 @@ impl PostAction {
             PostAction::Reboot => PostAction::PowerOff,
             PostAction::PowerOff => PostAction::Shutdown,
             PostAction::Shutdown => PostAction::Reboot,
+            PostAction::None => PostAction::Reboot,
         }
     }
 
@@ -110,6 +113,7 @@ impl PostAction {
             PostAction::Reboot => PostAction::Shutdown,
             PostAction::PowerOff => PostAction::Reboot,
             PostAction::Shutdown => PostAction::PowerOff,
+            PostAction::None => PostAction::Shutdown,
         }
     }
 
@@ -117,6 +121,7 @@ impl PostAction {
         match self {
             PostAction::Reboot => libefex::FesToolMode::Reboot,
             PostAction::PowerOff | PostAction::Shutdown => libefex::FesToolMode::PowerOff,
+            PostAction::None => libefex::FesToolMode::Normal,
         }
     }
 }
@@ -129,6 +134,7 @@ impl FromStr for PostAction {
             "reboot" => Ok(Self::Reboot),
             "poweroff" => Ok(Self::PowerOff),
             "shutdown" => Ok(Self::Shutdown),
+            "none" => Ok(Self::None),
             _ => Err(format!("Invalid post-flash action: {}", value)),
         }
     }
@@ -140,27 +146,42 @@ impl fmt::Display for PostAction {
             PostAction::Reboot => write!(f, "reboot"),
             PostAction::PowerOff => write!(f, "poweroff"),
             PostAction::Shutdown => write!(f, "shutdown"),
+            PostAction::None => write!(f, "none"),
         }
     }
 }
 
 /// Device selection requested by the caller.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeviceSelector {
     pub bus: Option<u8>,
     pub port: Option<u8>,
+    pub location: Option<String>,
 }
 
 impl DeviceSelector {
     pub fn new(bus: Option<u8>, port: Option<u8>) -> Self {
-        Self { bus, port }
+        Self {
+            bus,
+            port,
+            location: None,
+        }
     }
 
-    pub fn selected_pair(self) -> Option<(u8, u8)> {
+    pub fn with_location(mut self, location: Option<String>) -> Self {
+        self.location = location.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    pub fn selected_pair(&self) -> Option<(u8, u8)> {
         match (self.bus, self.port) {
             (Some(bus), Some(port)) => Some((bus, port)),
             _ => None,
         }
+    }
+
+    pub fn selected_location(&self) -> Option<&str> {
+        self.location.as_deref()
     }
 }
 
@@ -217,6 +238,7 @@ mod tests {
             ("reboot", PostAction::Reboot),
             ("poweroff", PostAction::PowerOff),
             ("shutdown", PostAction::Shutdown),
+            ("none", PostAction::None),
         ];
 
         for (value, action) in cases {
@@ -233,5 +255,16 @@ mod tests {
         );
         assert_eq!(DeviceSelector::new(Some(1), None).selected_pair(), None);
         assert_eq!(DeviceSelector::new(None, Some(5)).selected_pair(), None);
+    }
+
+    #[test]
+    fn physical_location_takes_a_stable_explicit_selector() {
+        let selector = DeviceSelector::new(Some(0), Some(10))
+            .with_location(Some("pciroot(0)#usbroot(0)#usb(4)".to_owned()));
+        assert_eq!(
+            selector.selected_location(),
+            Some("pciroot(0)#usbroot(0)#usb(4)")
+        );
+        assert_eq!(selector.selected_pair(), Some((0, 10)));
     }
 }

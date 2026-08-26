@@ -184,6 +184,26 @@ impl Logger {
         self.event_sink.emit(FlashEvent::Finished { post_action });
     }
 
+    pub fn verification(&self, status: &'static str, error_code: Option<i32>) {
+        self.event_sink
+            .emit(FlashEvent::Verification { status, error_code });
+    }
+
+    pub fn post_action(
+        &self,
+        action: PostAction,
+        status: &'static str,
+        attempt: u32,
+        error: Option<String>,
+    ) {
+        self.event_sink.emit(FlashEvent::PostAction {
+            action,
+            status,
+            attempt,
+            error,
+        });
+    }
+
     fn emit_progress_snapshot(&self) {
         let snapshot = self.reporter.snapshot();
         self.event_sink.emit(FlashEvent::Progress {

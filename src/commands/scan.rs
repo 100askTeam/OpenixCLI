@@ -35,10 +35,18 @@ pub async fn execute(detailed: bool) -> anyhow::Result<()> {
             format!(", Port {:03}", dev.port).white(),
             dev.port
         );
+        if let Some(location) = dev.location_path.as_deref() {
+            println!("    Physical location: {location}");
+        }
 
         if detailed {
             let mut ctx = Context::new();
-            if ctx.scan_usb_device_at(dev.bus, dev.port).is_err() {
+            let opened = if let Some(location) = dev.location_path.as_deref() {
+                ctx.scan_usb_device_by_location(location)
+            } else {
+                ctx.scan_usb_device_at(dev.bus, dev.port)
+            };
+            if opened.is_err() {
                 println!("    {}", "Failed to initialize device".red());
                 println!();
                 continue;

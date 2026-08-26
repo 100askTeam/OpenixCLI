@@ -20,6 +20,7 @@ OpenixCLI is a powerful and user-friendly CLI tool designed for flashing firmwar
 - **Progress Tracking**: Visual progress indicators during flash operations
 - **Partition Selection**: Flash specific partitions or entire firmware
 - **Verbose Logging**: Detailed debug output for troubleshooting
+- **Automation Output**: JSON Lines event stream for integrating flash progress into other tools
 
 ## Installation
 
@@ -77,8 +78,12 @@ openixcli flash <firmware_file> [options]
 | `--verify` | `-V` | Enable verification after write (default: true) |
 | `--mode` | `-m` | Flash mode: `partition`, `keep_data`, `partition_erase`, `full_erase` (default: full_erase) |
 | `--partitions` | `-p` | Comma-separated list of partitions to flash |
-| `--post-action` | `-a` | Post-flash action: `reboot`, `poweroff`, `shutdown` (default: reboot) |
+| `--post-action` | `-a` | Post-flash action: `reboot`, `poweroff`, `shutdown`, `none` (default: reboot) |
 | `--verbose` | `-v` | Enable verbose output |
+
+The global `--output jsonl` option emits one JSON object per line on standard output for flash
+automation. Events include logs, stage and partition changes, progress, verification, post-flash
+action status, and successful completion. Human-readable output remains the default.
 
 #### Flash Examples
 
@@ -104,6 +109,24 @@ Flash and power off after completion:
 
 ```bash
 openixcli flash firmware.img --post-action poweroff
+```
+
+Flash without leaving FES mode:
+
+```bash
+openixcli flash firmware.img --post-action none
+
+# Use a board-matched vendor IMAGEWTY package only as a RAM FES bootstrap,
+# then write the final logical mainline image. The bootstrap package is never
+# written to target storage.
+openixcli raw loader-mainline-bootstrap.img mainline.raw \
+  --mode command --bus 0 --port 2
+```
+
+Stream machine-readable flash events:
+
+```bash
+openixcli --output jsonl flash firmware.img
 ```
 
 ## Flash Modes

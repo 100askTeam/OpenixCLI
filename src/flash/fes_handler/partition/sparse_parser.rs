@@ -199,23 +199,14 @@ impl<'a> SparseDownloader<'a> {
                 .fes_verify_value(sector, size)
                 .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
 
-            if verify_resp.flag == EFEX_CRC32_VALID_FLAG {
-                let device_crc = verify_resp.media_crc as u32;
-                if local_checksum != device_crc {
-                    self.logger.warn(&format!(
-                        "Partition {} checksum mismatch: local=0x{:08x}, device=0x{:08x}",
-                        partition_name, local_checksum, device_crc
-                    ));
-                } else {
-                    self.logger
-                        .info(&format!("Partition {} verification passed", partition_name));
-                }
-            } else {
-                self.logger.warn(&format!(
-                    "Partition {} verification failed: invalid CRC flag",
-                    partition_name
-                ));
-            }
+            validate_sparse_verification(
+                partition_name,
+                verify_resp.flag,
+                local_checksum,
+                verify_resp.media_crc as u32,
+            )?;
+            self.logger
+                .info(&format!("Partition {} verification passed", partition_name));
         }
 
         let total_written = parser.total_written();
@@ -227,6 +218,25 @@ impl<'a> SparseDownloader<'a> {
 
         Ok(())
     }
+}
+
+fn validate_sparse_verification(
+    name: &str,
+    flag: u32,
+    local_checksum: u32,
+    media_checksum: u32,
+) -> FlashResult<()> {
+    if flag != EFEX_CRC32_VALID_FLAG {
+        return Err(FlashError::PartitionDownloadFailed(format!(
+            "SPARSE_PARTITION_VERIFY_STATUS_INVALID:name={name}:flag=0x{flag:04x}"
+        )));
+    }
+    if local_checksum != media_checksum {
+        return Err(FlashError::PartitionDownloadFailed(format!(
+            "SPARSE_PARTITION_VERIFY_MISMATCH:name={name}:local=0x{local_checksum:08x}:device=0x{media_checksum:08x}"
+        )));
+    }
+    Ok(())
 }
 
 /// Parameters for sparse download operation
@@ -644,5 +654,25 @@ impl<'a> SparseParser<'a> {
                 "Verification timeout: device did not return valid CRC".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod strict_verification_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_partition_verification_is_strict() {
+        assert!(validate_sparse_verification("rootfs", EFEX_CRC32_VALID_FLAG, 1, 1).is_ok());
+        assert!(validate_sparse_verification("rootfs", 0, 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("SPARSE_PARTITION_VERIFY_STATUS_INVALID"));
+        assert!(
+            validate_sparse_verification("rootfs", EFEX_CRC32_VALID_FLAG, 1, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("SPARSE_PARTITION_VERIFY_MISMATCH")
+        );
     }
 }

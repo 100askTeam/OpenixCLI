@@ -17,6 +17,7 @@ pub use erase_flag::EraseFlag;
 pub use mbr_download::MbrDownload;
 pub use partition::PartitionDownload;
 pub use partition_planner::PartitionPlanner;
+pub(crate) use types::IncrementalChecksum;
 pub use ubifs_config::UbifsConfig;
 
 use crate::config::boot_header::get_sunxi_boot_file_mode_string;
@@ -53,6 +54,7 @@ impl<'a> FesHandler<'a> {
         ctx: &libefex::Context,
         packer: &mut OpenixPacker,
         request: &FlashRequest,
+        nand_components: bool,
     ) -> FlashResult<()> {
         self.logger.begin_stage(StageType::FesQuery);
 
@@ -67,10 +69,17 @@ impl<'a> FesHandler<'a> {
         let storage_type = ctx
             .fes_query_storage()
             .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
-        self.logger.info(&format!(
-            "Storage type: {}",
-            StorageType::from(storage_type)
-        ));
+        let storage_kind = StorageType::from(storage_type);
+        self.logger.info(&format!("Storage type: {}", storage_kind));
+
+        if nand_components {
+            validate_nand_component_storage(storage_kind)?;
+            validate_nand_component_mode(request.mode)?;
+            self.logger
+                .info("NAND_COMPONENT_STORAGE_PREFLIGHT:accepted");
+            self.logger
+                .info(&format!("NAND_COMPONENT_LAYOUT_POLICY:{}", request.mode));
+        }
 
         let flash_size = ctx
             .fes_probe_flash_size()
@@ -81,6 +90,43 @@ impl<'a> FesHandler<'a> {
         ));
 
         self.logger.complete_stage();
+
+        // Lab-only, read-only SPI-NAND dump used to compare the physical boot
+        // area with the packaged SPL/U-Boot images. LYNX never sets this.
+        if let Some(path) = std::env::var_os("OPENIXCLI_DIAGNOSTIC_DUMP_SPINAND_BOOT") {
+            let mut boot0 = vec![0u8; 24 * 1024];
+            ctx.fes_spinand_up(&mut boot0, 0, libefex::FesDataType::NandBoot0)
+                .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
+            let mut boot1_head = vec![0u8; 64 * 1024];
+            ctx.fes_spinand_up(&mut boot1_head, 0, libefex::FesDataType::NandBoot1)
+                .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
+            std::fs::write(&path, &boot0)
+                .map_err(|e| FlashError::InvalidFirmwareFormat(e.to_string()))?;
+            let boot1_path = std::path::PathBuf::from(&path).with_extension("boot1-head.bin");
+            std::fs::write(&boot1_path, &boot1_head)
+                .map_err(|e| FlashError::InvalidFirmwareFormat(e.to_string()))?;
+            self.logger.stage_complete(&format!(
+                "DIAGNOSTIC_DUMP_SPINAND_BOOT:wrote:{}:{};{}:{}",
+                std::path::Path::new(&path).display(),
+                boot0.len(),
+                boot1_path.display(),
+                boot1_head.len()
+            ));
+            return Ok(());
+        }
+
+        // Explicit lab-recovery gate. LYNX never sets this variable during a
+        // production flash; it is used only with a recovery loader whose force
+        // erase implementation scrubs false NAND bad-block markers.
+        if std::env::var_os("OPENIXCLI_DIAGNOSTIC_FORCE_ERASE_FLASH").is_some() {
+            self.logger
+                .warn("DIAGNOSTIC_FORCE_ERASE_FLASH: scrubbing the complete selected medium");
+            ctx.fes_force_erase_flash()
+                .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
+            self.logger
+                .stage_complete("DIAGNOSTIC_FORCE_ERASE_FLASH: device reported success");
+            return Ok(());
+        }
 
         if request.mode != FlashMode::Partition {
             self.logger.begin_stage(StageType::FesErase);
@@ -103,17 +149,22 @@ impl<'a> FesHandler<'a> {
         let download_list = partition_planner.prepare(packer, &mbr_info, request)?;
 
         let ubifs_config = UbifsConfig::new(&*self.logger);
-        ubifs_config.execute(
-            ctx,
-            &mut *packer,
-            &download_list,
-            StorageType::from(storage_type),
-        )?;
+        ubifs_config.execute(ctx, &mut *packer, &download_list, storage_kind)?;
 
         let mbr_download = MbrDownload::new(&*self.logger);
         mbr_download.execute(ctx, &mbr_data).await?;
 
         self.logger.complete_stage();
+
+        // Lab-only discriminator for FES compatibility investigations. This is
+        // deliberately environment-gated and is never set by the LYNX worker.
+        // It lets us prove that a loader accepts a package MBR without writing
+        // any partition or boot payload from that package.
+        if std::env::var_os("OPENIXCLI_DIAGNOSTIC_STOP_AFTER_MBR").is_some() {
+            self.logger
+                .info("DIAGNOSTIC_STOP_AFTER_MBR: no partition or boot payload was written");
+            return Ok(());
+        }
 
         if !download_list.is_empty() {
             self.logger.begin_stage(StageType::FesPartitions);
@@ -139,5 +190,71 @@ impl<'a> FesHandler<'a> {
         }
 
         Ok(())
+    }
+}
+
+fn validate_nand_component_storage(storage_type: StorageType) -> FlashResult<()> {
+    match storage_type {
+        StorageType::Nand | StorageType::Spinand => Ok(()),
+        other => Err(FlashError::InvalidFirmwareFormat(format!(
+            "NAND_COMPONENT_PACKAGE_STORAGE_MISMATCH: device storage is {other}"
+        ))),
+    }
+}
+
+fn validate_nand_component_mode(mode: FlashMode) -> FlashResult<()> {
+    match mode {
+        FlashMode::PartitionErase | FlashMode::FullErase => Ok(()),
+        FlashMode::Partition | FlashMode::KeepData => Err(FlashError::InvalidFirmwareFormat(
+            format!(
+                "NAND_COMPONENT_LAYOUT_REQUIRES_ERASE_POLICY: mode={mode}; use partition_erase or full_erase"
+            ),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_nand_component_mode, validate_nand_component_storage};
+    use crate::firmware::StorageType;
+    use crate::flash::FlashMode;
+
+    #[test]
+    fn component_package_accepts_only_nand_media() {
+        assert!(validate_nand_component_storage(StorageType::Nand).is_ok());
+        assert!(validate_nand_component_storage(StorageType::Spinand).is_ok());
+        for storage in [
+            StorageType::Spinor,
+            StorageType::Sdcard,
+            StorageType::Sd1,
+            StorageType::Emmc,
+            StorageType::Emmc3,
+            StorageType::Emmc0,
+            StorageType::Ufs,
+            StorageType::Auto,
+        ] {
+            let error = validate_nand_component_storage(storage)
+                .expect_err("component package must be rejected on non-NAND media");
+            assert!(error
+                .to_string()
+                .contains("NAND_COMPONENT_PACKAGE_STORAGE_MISMATCH"));
+        }
+    }
+
+    #[test]
+    fn nand_component_layout_accepts_bad_block_aware_erase_policies() {
+        assert!(validate_nand_component_mode(FlashMode::PartitionErase).is_ok());
+        assert!(validate_nand_component_mode(FlashMode::FullErase).is_ok());
+    }
+
+    #[test]
+    fn nand_component_layout_rejects_modes_that_cannot_replace_the_mbr() {
+        for mode in [FlashMode::Partition, FlashMode::KeepData] {
+            let error = validate_nand_component_mode(mode)
+                .expect_err("component MBR replacement requires an erase policy");
+            assert!(error
+                .to_string()
+                .contains("NAND_COMPONENT_LAYOUT_REQUIRES_ERASE_POLICY"));
+        }
     }
 }

@@ -62,8 +62,8 @@ pub enum FlashError {
     #[error("Partition download failed: {0}")]
     PartitionDownloadFailed(String),
 
-    #[error("Device reconnect failed")]
-    ReconnectFailed,
+    #[error("Device reconnect failed: {0}")]
+    ReconnectFailed(String),
 
     #[error("Storage type mismatch: device={device}, firmware={firmware}")]
     StorageTypeMismatch { device: String, firmware: String },

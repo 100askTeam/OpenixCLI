@@ -54,6 +54,38 @@ impl FlashStages {
         instance
     }
 
+    /// Create stages for a raw whole-disk write that starts in FEL mode and
+    /// uses a vendor package only to boot the RAM FES service.
+    pub fn for_raw_fel_mode() -> Self {
+        let mut instance = Self::new();
+        instance.stages = vec![
+            StageType::Init,
+            StageType::FelDram,
+            StageType::FelUboot,
+            StageType::FelReconnect,
+            StageType::FesErase,
+            StageType::FesQuery,
+            StageType::FesMbr,
+            StageType::FesPartitions,
+            StageType::FesMode,
+        ];
+        instance
+    }
+
+    /// Create stages for a raw whole-disk write when FES is already running.
+    pub fn for_raw_fes_mode() -> Self {
+        let mut instance = Self::new();
+        instance.stages = vec![
+            StageType::Init,
+            StageType::FesErase,
+            StageType::FesQuery,
+            StageType::FesMbr,
+            StageType::FesPartitions,
+            StageType::FesMode,
+        ];
+        instance
+    }
+
     /// Get the stages as a slice
     pub fn stages(&self) -> &[StageType] {
         &self.stages

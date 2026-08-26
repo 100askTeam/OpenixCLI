@@ -204,6 +204,33 @@ fn send_flash_event(tx: &mpsc::UnboundedSender<AppEvent>, event: FlashEvent) {
                 speed,
             });
         }
+        FlashEvent::Verification { status, error_code } => {
+            let level = if status == "failed" {
+                LogLevel::Error
+            } else {
+                LogLevel::Info
+            };
+            let _ = tx.send(AppEvent::LogMessage(
+                level,
+                format!("Verification: {status} (error code: {error_code:?})"),
+            ));
+        }
+        FlashEvent::PostAction {
+            action,
+            status,
+            attempt,
+            error,
+        } => {
+            let level = if status == "failed" {
+                LogLevel::Error
+            } else {
+                LogLevel::Info
+            };
+            let _ = tx.send(AppEvent::LogMessage(
+                level,
+                format!("Post action {action}: {status} (attempt {attempt}) {error:?}"),
+            ));
+        }
         FlashEvent::Finished { .. } => {}
     }
 }

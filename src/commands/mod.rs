@@ -4,6 +4,7 @@
 
 pub mod flash;
 pub mod inspect;
+pub mod mainline;
 pub mod scan;
 pub mod types;
 pub mod unpack;

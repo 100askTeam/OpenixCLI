@@ -79,11 +79,10 @@ impl<'a> RawDownloader<'a> {
             let chunk_data = match chunk_data {
                 Ok(data) => data,
                 Err(e) => {
-                    self.logger.warn(&format!(
-                        "Failed to read chunk data for {}: {}",
-                        info.partition_name, e
-                    ));
-                    break;
+                    return Err(FlashError::PartitionDownloadFailed(format!(
+                        "PARTITION_SOURCE_READ_FAILED:name={}:offset={chunk_offset}:error={e}",
+                        info.partition_name
+                    )));
                 }
             };
 
@@ -133,27 +132,57 @@ impl<'a> RawDownloader<'a> {
                 .fes_verify_value(info.partition_address as u32, info.data_length)
                 .map_err(|e| FlashError::UsbTransferError(e.to_string()))?;
 
-            if verify_resp.flag == EFEX_CRC32_VALID_FLAG {
-                let media_crc = verify_resp.media_crc as u32;
-                if local_checksum != media_crc {
-                    self.logger.warn(&format!(
-                        "Partition {} checksum mismatch: local=0x{:x}, device=0x{:x}",
-                        info.partition_name, local_checksum, media_crc
-                    ));
-                } else {
-                    self.logger
-                        .stage_complete(&format!("Partition {} verified", info.partition_name));
-                }
-            } else {
-                self.logger.warn(&format!(
-                    "Partition {} verification failed",
-                    info.partition_name
-                ));
-            }
+            validate_partition_verification(
+                &info.partition_name,
+                verify_resp.flag,
+                local_checksum,
+                verify_resp.media_crc as u32,
+            )?;
+            self.logger
+                .stage_complete(&format!("Partition {} verified", info.partition_name));
         } else {
             self.logger
                 .stage_complete(&format!("Partition {} flashed", info.partition_name));
         }
         Ok(())
+    }
+}
+
+fn validate_partition_verification(
+    name: &str,
+    flag: u32,
+    local_checksum: u32,
+    media_checksum: u32,
+) -> FlashResult<()> {
+    if flag != EFEX_CRC32_VALID_FLAG {
+        return Err(FlashError::PartitionDownloadFailed(format!(
+            "PARTITION_VERIFY_STATUS_INVALID:name={name}:flag=0x{flag:04x}"
+        )));
+    }
+    if local_checksum != media_checksum {
+        return Err(FlashError::PartitionDownloadFailed(format!(
+            "PARTITION_VERIFY_MISMATCH:name={name}:local=0x{local_checksum:08x}:device=0x{media_checksum:08x}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_verification_is_strict() {
+        assert!(validate_partition_verification("boot", EFEX_CRC32_VALID_FLAG, 7, 7).is_ok());
+        assert!(validate_partition_verification("boot", 0, 7, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("PARTITION_VERIFY_STATUS_INVALID"));
+        assert!(
+            validate_partition_verification("rootfs", EFEX_CRC32_VALID_FLAG, 7, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("PARTITION_VERIFY_MISMATCH")
+        );
     }
 }

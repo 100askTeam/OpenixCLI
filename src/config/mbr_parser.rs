@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 /// MBR magic string
 pub const MBR_MAGIC: &str = "softw411";
 /// MBR version
@@ -19,6 +21,70 @@ pub const MBR_MAX_PART_CNT: usize = 120;
 
 /// CRC32 valid flag
 pub const EFEX_CRC32_VALID_FLAG: u32 = 0x6a617603;
+
+const MBR_HEADER_SIZE: usize = 32;
+const PARTITION_ENTRY_SIZE: usize = 128;
+
+/// Build the one-partition Allwinner MBR used by the FES raw-disk flow.
+///
+/// The external image is exposed to FES as a `raw` partition in class `DISK`.
+/// Addresses and lengths are expressed in 512-byte logical sectors.
+pub fn build_generic_raw_mbr(
+    start_sector: u64,
+    sector_count: u64,
+) -> Result<Vec<u8>, &'static str> {
+    if sector_count == 0 {
+        return Err("Raw partition must contain at least one sector");
+    }
+
+    let mut mbr = vec![0_u8; MBR_SIZE];
+    write_u32(&mut mbr, 4, MBR_VERSION);
+    mbr[8..16].copy_from_slice(MBR_MAGIC.as_bytes());
+    write_u32(&mut mbr, 16, 1); // one MBR copy
+    write_u32(&mut mbr, 20, 0); // copy index
+    write_u32(&mut mbr, 24, 1); // one partition
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as u32)
+        .unwrap_or(0);
+    write_u32(&mut mbr, 28, stamp);
+
+    let partition = MBR_HEADER_SIZE;
+    write_u64_halves(&mut mbr, partition, start_sector);
+    write_u64_halves(&mut mbr, partition + 8, sector_count);
+    write_name(&mut mbr, partition + 16, "DISK");
+    write_name(&mut mbr, partition + 32, "raw");
+    debug_assert_eq!(PARTITION_ENTRY_SIZE, SUNXI_PARTITION_SIZE);
+
+    let crc = sunxi_mbr_crc32(&mbr[4..]);
+    write_u32(&mut mbr, 0, crc);
+    Ok(mbr)
+}
+
+fn write_u32(target: &mut [u8], offset: usize, value: u32) {
+    target[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64_halves(target: &mut [u8], offset: usize, value: u64) {
+    write_u32(target, offset, (value >> 32) as u32);
+    write_u32(target, offset + 4, value as u32);
+}
+
+fn write_name(target: &mut [u8], offset: usize, value: &str) {
+    let bytes = value.as_bytes();
+    target[offset..offset + bytes.len()].copy_from_slice(bytes);
+}
+
+fn sunxi_mbr_crc32(data: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
 
 /// Raw partition entry structure
 ///
@@ -226,4 +292,47 @@ pub fn is_valid_mbr(data: &[u8]) -> bool {
 
     let raw = SunxiMbrRaw::parse(data);
     raw.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference_crc32(data: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in data {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn generic_raw_mbr_matches_fes_single_partition_contract() {
+        let sectors = 56_832;
+        let bytes = build_generic_raw_mbr(0, sectors).unwrap();
+        assert_eq!(bytes.len(), MBR_SIZE);
+
+        let parsed = SunxiMbr::parse(&bytes).unwrap();
+        assert_eq!(parsed.version, MBR_VERSION);
+        assert_eq!(parsed.magic, MBR_MAGIC);
+        assert_eq!(parsed.copy, 1);
+        assert_eq!(parsed.index, 0);
+        assert_eq!(parsed.part_count, 1);
+        assert_eq!(parsed.partitions.len(), 1);
+        assert_eq!(parsed.partitions[0].classname, "DISK");
+        assert_eq!(parsed.partitions[0].name, "raw");
+        assert_eq!(parsed.partitions[0].address(), 0);
+        assert_eq!(parsed.partitions[0].length(), sectors);
+
+        let stored_crc = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(stored_crc, reference_crc32(&bytes[4..]));
+    }
+
+    #[test]
+    fn generic_raw_mbr_rejects_empty_partition() {
+        assert!(build_generic_raw_mbr(0, 0).is_err());
+    }
 }

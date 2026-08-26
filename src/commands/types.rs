@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::flash::{DeviceSelector, FlashMode, FlashRequest, PostAction};
+use crate::flash::{DeviceSelector, FlashMode, FlashRequest, PostAction, RawMode};
 
 /// Arguments for the flash command
 ///
@@ -19,19 +19,27 @@ use crate::flash::{DeviceSelector, FlashMode, FlashRequest, PostAction};
 /// * `verbose` - Enable verbose output
 pub struct FlashArgs {
     pub firmware_path: PathBuf,
+    pub raw: bool,
+    pub nand_components: bool,
+    pub raw_mode: RawMode,
+    pub bootstrap_firmware_path: Option<PathBuf>,
+    pub storage_geometry_serial_port: Option<String>,
+    pub storage_geometry_serial_baud: u32,
     pub bus: Option<u8>,
     pub port: Option<u8>,
+    pub device_location: Option<String>,
     pub verify: bool,
     pub mode: FlashMode,
     pub partitions: Option<Vec<String>>,
     pub post_action: PostAction,
     pub verbose: bool,
+    pub jsonl: bool,
 }
 
 impl FlashArgs {
     pub fn request(&self) -> FlashRequest {
         FlashRequest::new(
-            DeviceSelector::new(self.bus, self.port),
+            DeviceSelector::new(self.bus, self.port).with_location(self.device_location.clone()),
             self.verify,
             self.mode,
             self.partitions.clone(),
@@ -81,13 +89,21 @@ mod tests {
     fn flash_args_builds_shared_request() {
         let args = FlashArgs {
             firmware_path: PathBuf::from("firmware.img"),
+            raw: false,
+            nand_components: false,
+            raw_mode: RawMode::Command,
+            bootstrap_firmware_path: None,
+            storage_geometry_serial_port: None,
+            storage_geometry_serial_baud: 115_200,
             bus: Some(1),
             port: Some(2),
+            device_location: None,
             verify: false,
             mode: FlashMode::Partition,
             partitions: Some(vec!["boot".to_string()]),
             post_action: PostAction::PowerOff,
             verbose: true,
+            jsonl: false,
         };
 
         let request = args.request();
