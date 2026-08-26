@@ -26,7 +26,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 
 [dependencies.libefex]
-path = "../libefex/rust/libefex"
+git = "https://github.com/100askTeam/libefex"
+rev = "d4d21efa1062d0d00c3a34bf440941e493d0bd6e"
 
 [[bin]]
 name = "openixcli"

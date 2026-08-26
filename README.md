@@ -1,5 +1,12 @@
 # OpenixCLI
 
+> **Archived development snapshot:** branch
+> `backup/t113-fes-nand-v0.2.10-20260825` preserves the pre-clean T113 FES
+> NAND component implementation and bounded mainline RAM worker. It is not a
+> stable release and must not be merged wholesale into the 100ask master
+> branch. Its libefex dependency is pinned to the matching backup commit so a
+> standalone clone can be built and audited.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
 
