@@ -27,7 +27,7 @@ crossterm = "0.29"
 
 [dependencies.libefex]
 git = "https://github.com/100askTeam/libefex"
-rev = "d4d21efa1062d0d00c3a34bf440941e493d0bd6e"
+rev = "ae33d120a103e1cd56437ea254c6e78cdf4f7f93"
 
 [[bin]]
 name = "openixcli"
