@@ -1,10 +1,9 @@
 # OpenixCLI
 
-> **Archived development snapshot:** branch
-> `backup/t113-fes-nand-v0.2.10-20260825` preserves the pre-clean T113 FES
-> NAND component implementation and bounded mainline RAM worker. It is not a
-> stable release and must not be merged wholesale into the 100ask master
-> branch. Its libefex dependency is pinned to the matching backup commit so a
+> **Feature branch:** the current branch combines the reviewed T113 FES NAND
+> component path, bounded mainline RAM recovery worker, and T527 eMMC raw/FES
+> path. It is hardware-qualified but remains a feature branch until the
+> downstream release gate is complete. The libefex dependency is pinned so a
 > standalone clone can be built and audited.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -39,7 +38,7 @@ OpenixCLI is a powerful and user-friendly CLI tool designed for flashing firmwar
 ### Build from Source
 
 ```bash
-git clone https://github.com/YuzukiTsuru/OpenixCLI
+git clone --branch feat/t527-mainline-emmc-fes https://github.com/100askTeam/OpenixCLI
 cd OpenixCLI
 cargo build --release
 ```
@@ -130,6 +129,23 @@ openixcli raw loader-mainline-bootstrap.img mainline.raw \
   --mode command --bus 0 --port 2
 ```
 
+For Avaota A1 T527 eMMC, install the checksum-validated mainline SPL into
+hardware Boot0 and write the whole-disk image to the user area:
+
+```bash
+openixcli --output jsonl flash avaota-a1-full-mainline.img \
+  --raw \
+  --emmc-boot0-from-image \
+  --bootstrap-firmware avaota-a1-loader.img \
+  --device-location libusb:3:1 \
+  --mode partition \
+  --verify true \
+  --post-action none
+```
+
+See [T527 eMMC through FES](docs/t527-emmc-fes.md) for the exact safety and
+verification boundaries.
+
 Stream machine-readable flash events:
 
 ```bash
@@ -180,5 +196,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- Built with [libefex](https://github.com/YuzukiTsuru/libefex) for Allwinner USB communication
+- Built with [100askTeam/libefex](https://github.com/100askTeam/libefex) for Allwinner USB communication
 - Inspired by the need for a modern, reliable firmware flashing tool for Allwinner devices

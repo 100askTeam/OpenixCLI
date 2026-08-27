@@ -1,7 +1,7 @@
 //! Whole-disk raw image writer for an already-running Allwinner FES service.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use libefex::FesDataType;
+use sha2::{Digest, Sha256};
 
 use crate::config::mbr_parser::{build_generic_raw_mbr, EFEX_CRC32_VALID_FLAG};
 use crate::firmware::{OpenixPacker, StorageType};
@@ -21,6 +22,13 @@ const SECTOR_SIZE: u64 = 512;
 /// the FES protocol's 64 KiB USB transfers.
 const RAW_READ_WINDOW_SIZE: usize = 10 * 1024 * 1024;
 const LYNX_CANCEL_FILE_ENV: &str = "LYNX_FLASH_CANCEL_FILE";
+/// Tina FES exposes SD/eMMC user storage after a 20 MiB logical prefix.  A
+/// command image is a physical-disk image, so its FES address must wrap by the
+/// inverse offset: 0xffff6000 + 0x0000a000 == physical sector zero.
+const FES_SDMMC_LOGICAL_OFFSET_SECTORS: u32 = 40_960;
+const MAINLINE_SPL_DISK_OFFSET: u64 = 8 * 1024;
+const MAINLINE_SPL_MAX_BYTES: usize = 1024 * 1024;
+const FES_BOOT0_VERIFY_TAG: u32 = 0x7f03;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum RawMode {
@@ -36,13 +44,35 @@ struct RawLayout {
 }
 
 impl RawMode {
-    const fn layout(self) -> RawLayout {
+    const fn layout(self, storage_type: StorageType) -> RawLayout {
         match self {
-            Self::Command => RawLayout {
-                start_sector: 0,
-                copies: 1,
-                wrapping_address: false,
-            },
+            Self::Command => {
+                let sdmmc = matches!(
+                    storage_type,
+                    StorageType::Emmc
+                        | StorageType::Emmc3
+                        | StorageType::Emmc0
+                        | StorageType::Sdcard
+                        | StorageType::Sd1
+                );
+                RawLayout {
+                    start_sector: if sdmmc {
+                        u32::MAX.wrapping_sub(FES_SDMMC_LOGICAL_OFFSET_SECTORS - 1) as u64
+                    } else {
+                        0
+                    },
+                    copies: crate::config::mbr_parser::MBR_COPY_NUM as u32,
+                    wrapping_address: sdmmc,
+                }
+            }
+        }
+    }
+
+    const fn physical_start_sector(layout: RawLayout) -> u64 {
+        if layout.wrapping_address {
+            0
+        } else {
+            layout.start_sector
         }
     }
 }
@@ -52,6 +82,7 @@ pub struct RawDiskFlasher {
     bootstrap_packer: Option<OpenixPacker>,
     geometry_serial: Option<RuntimeStorageGeometrySerial>,
     raw_mode: RawMode,
+    emmc_boot0_from_image: bool,
     request: FlashRequest,
     logger: Logger,
 }
@@ -68,6 +99,7 @@ impl RawDiskFlasher {
         bootstrap_packer: Option<OpenixPacker>,
         geometry_serial: Option<RuntimeStorageGeometrySerial>,
         raw_mode: RawMode,
+        emmc_boot0_from_image: bool,
         request: FlashRequest,
         logger: Logger,
     ) -> Self {
@@ -76,6 +108,7 @@ impl RawDiskFlasher {
             bootstrap_packer,
             geometry_serial,
             raw_mode,
+            emmc_boot0_from_image,
             request,
             logger,
         }
@@ -91,6 +124,17 @@ impl RawDiskFlasher {
             return Err(FlashError::InvalidFirmwareFormat(format!(
                 "RAW_IMAGE_ALIGNMENT: image size must be a non-zero multiple of {SECTOR_SIZE} bytes"
             )));
+        }
+        let emmc_boot0 = self
+            .emmc_boot0_from_image
+            .then(|| extract_mainline_spl(&self.image_path, image_len))
+            .transpose()?;
+        if let Some(spl) = emmc_boot0.as_ref() {
+            self.logger.info(&format!(
+                "EMMC_BOOT0_ARTIFACT:source=image@0x{MAINLINE_SPL_DISK_OFFSET:X},bytes={},sha256={:x}",
+                spl.len(),
+                Sha256::digest(spl)
+            ));
         }
 
         let mut geometry_capture = self
@@ -119,7 +163,6 @@ impl RawDiskFlasher {
                     .to_owned(),
             ));
         }
-
         // Besides reporting the boot security type, this query precedes
         // erase-policy and MBR commands in every supported FES write sequence.
         ensure_not_cancelled()?;
@@ -140,6 +183,11 @@ impl RawDiskFlasher {
             .map_err(|error| FlashError::UsbTransferError(error.to_string()))?;
         let storage_type = StorageType::from(storage_code);
         validate_raw_storage(storage_type)?;
+        if emmc_boot0.is_some() && !is_emmc_storage(storage_type) {
+            return Err(FlashError::InvalidFirmwareFormat(format!(
+                "EMMC_BOOT0_STORAGE_MISMATCH: requested eMMC Boot0 installation but FES detected {storage_type}"
+            )));
+        }
         self.logger
             .info(&format!("RAW_TARGET_STORAGE:{storage_type}"));
 
@@ -165,7 +213,7 @@ impl RawDiskFlasher {
         let (flash_sectors, capacity_source) =
             resolve_capacity_sectors(storage_type, probed_sectors, geometry_observation.clone())?;
         let flash_bytes = capacity_bytes_from_sectors(flash_sectors)?;
-        let raw_layout = self.raw_mode.layout();
+        let raw_layout = self.raw_mode.layout(storage_type);
         let write_plan = RawWritePlan::new(image_len);
         self.logger
             .info(&format!("RAW_TARGET_CAPACITY_SOURCE:{capacity_source}"));
@@ -174,8 +222,7 @@ impl RawDiskFlasher {
         self.logger
             .info(&format!("RAW_TARGET_CAPACITY:{flash_bytes}"));
         let image_sectors = image_len / SECTOR_SIZE;
-        let required_sectors = raw_layout
-            .start_sector
+        let required_sectors = RawMode::physical_start_sector(raw_layout)
             .checked_add(image_sectors)
             .ok_or_else(|| {
                 FlashError::InvalidFirmwareFormat(
@@ -235,6 +282,15 @@ impl RawDiskFlasher {
         self.logger.info("RAW_MBR_DOWNLOAD_READY");
         self.logger.complete_stage();
 
+        // Tina FES Boot0 writes can alias a copy of the SPL into the eMMC user
+        // area (observed at physical 0x20000 on T527). Install Boot0 before the
+        // raw user-area image so the following full-disk write repairs that
+        // alias. The final raw verification then also covers alias damage.
+        if let Some(spl) = emmc_boot0.as_ref() {
+            ensure_not_cancelled()?;
+            self.install_emmc_boot0(&ctx, spl)?;
+        }
+
         // The generated MBR establishes the partition layout; flash access is
         // enabled once for the following partition phase.
         let flash_access = FlashAccessGuard::enable(&ctx, storage_code)?;
@@ -262,16 +318,12 @@ impl RawDiskFlasher {
             }
             let chunk = &buffer[..read];
             checksum.update(chunk);
-            let sector = raw_layout
-                .start_sector
-                .checked_add(offset / SECTOR_SIZE)
-                .and_then(|sector| u32::try_from(sector).ok())
-                .ok_or_else(|| {
-                    FlashError::InvalidFirmwareFormat(
-                        "RAW_IMAGE_ADDRESS_OVERFLOW: target sector exceeds the FES protocol"
-                            .to_owned(),
-                    )
-                })?;
+            let relative_sector = u32::try_from(offset / SECTOR_SIZE).map_err(|_| {
+                FlashError::InvalidFirmwareFormat(
+                    "RAW_IMAGE_ADDRESS_OVERFLOW: target sector exceeds the FES protocol".to_owned(),
+                )
+            })?;
+            let sector = (raw_layout.start_sector as u32).wrapping_add(relative_sector);
             let chunk_index = successful_chunks;
             let sector_count = read as u64 / SECTOR_SIZE;
             let transfer = ctx.fes_down_with_progress(chunk, sector, FesDataType::Flash, {
@@ -372,6 +424,91 @@ impl RawDiskFlasher {
             .post_action(self.request.post_action, "success", 1, None);
         Ok(())
     }
+
+    fn install_emmc_boot0(&self, ctx: &libefex::Context, spl: &[u8]) -> FlashResult<()> {
+        self.logger
+            .info("EMMC_BOOT0_WRITE_START:method=fes_boot0_component");
+        ctx.fes_down(spl, 0, FesDataType::Boot0).map_err(|error| {
+            FlashError::UsbTransferError(format!("EMMC_BOOT0_WRITE_FAILED:{error}"))
+        })?;
+        let status = ctx
+            .fes_verify_status(FES_BOOT0_VERIFY_TAG)
+            .map_err(|error| {
+                FlashError::UsbTransferError(format!("EMMC_BOOT0_STATUS_FAILED:{error}"))
+            })?;
+        if status.flag != EFEX_CRC32_VALID_FLAG || status.media_crc != 0 {
+            return Err(FlashError::Unknown(format!(
+                "EMMC_BOOT0_STATUS_INVALID:flag=0x{:04x},status=0x{:08x}",
+                status.flag, status.media_crc
+            )));
+        }
+
+        let expected = Sha256::digest(spl);
+        self.logger.info(&format!(
+            "EMMC_BOOT0_VERIFIED:method=fes_boot0_status,bytes={},sourceSha256={expected:x}",
+            spl.len()
+        ));
+        self.logger.info(
+            "EMMC_BOOT0_READBACK_UNAVAILABLE:FES FlashBoot0 upload aliases the eMMC user area and cannot prove hardware boot-partition byte identity",
+        );
+        Ok(())
+    }
+}
+
+fn is_emmc_storage(storage_type: StorageType) -> bool {
+    matches!(
+        storage_type,
+        StorageType::Emmc | StorageType::Emmc3 | StorageType::Emmc0
+    )
+}
+
+fn extract_mainline_spl(path: &Path, image_len: u64) -> FlashResult<Vec<u8>> {
+    if image_len < MAINLINE_SPL_DISK_OFFSET + 0x20 {
+        return Err(FlashError::InvalidFirmwareFormat(
+            "EMMC_BOOT0_IMAGE_TOO_SMALL".to_owned(),
+        ));
+    }
+    let mut file = File::open(path).map_err(FlashError::Io)?;
+    file.seek(SeekFrom::Start(MAINLINE_SPL_DISK_OFFSET))
+        .map_err(FlashError::Io)?;
+    let mut header = [0_u8; 0x20];
+    file.read_exact(&mut header).map_err(FlashError::Io)?;
+    if header.get(4..12) != Some(b"eGON.BT0") || header.get(0x14..0x17) != Some(b"SPL") {
+        return Err(FlashError::InvalidFirmwareFormat(
+            "EMMC_BOOT0_MAINLINE_SPL_REQUIRED:image offset 0x2000 has no eGON.BT0 SPL".to_owned(),
+        ));
+    }
+    let version = header[0x17];
+    if !(1..=31).contains(&version) {
+        return Err(FlashError::InvalidFirmwareFormat(format!(
+            "EMMC_BOOT0_SPL_VERSION_UNSUPPORTED:{version}"
+        )));
+    }
+    let length = u32::from_le_bytes(header[0x10..0x14].try_into().expect("four bytes")) as usize;
+    if !(0x20..=MAINLINE_SPL_MAX_BYTES).contains(&length)
+        || !length.is_multiple_of(4)
+        || MAINLINE_SPL_DISK_OFFSET + length as u64 > image_len
+    {
+        return Err(FlashError::InvalidFirmwareFormat(format!(
+            "EMMC_BOOT0_SPL_LENGTH_INVALID:{length}"
+        )));
+    }
+    let mut spl = vec![0_u8; length];
+    spl[..header.len()].copy_from_slice(&header);
+    file.read_exact(&mut spl[header.len()..])
+        .map_err(FlashError::Io)?;
+    let stored = u32::from_le_bytes(spl[0x0c..0x10].try_into().expect("four bytes"));
+    let expected_sum = stored.wrapping_mul(2).wrapping_sub(0x5f0a_6c39);
+    let actual_sum = spl.chunks_exact(4).fold(0_u32, |sum, word| {
+        sum.wrapping_add(u32::from_le_bytes(word.try_into().expect("four bytes")))
+    });
+    if actual_sum != expected_sum {
+        return Err(FlashError::InvalidFirmwareFormat(
+            "EMMC_BOOT0_SPL_CHECKSUM_INVALID".to_owned(),
+        ));
+    }
+
+    Ok(spl)
 }
 
 struct FlashAccessGuard<'a> {
@@ -657,10 +794,18 @@ mod tests {
     #[test]
     fn command_raw_contract_is_sector_aligned_and_starts_at_disk_zero() {
         assert_eq!(SECTOR_SIZE, 512);
-        let layout = RawMode::Command.layout();
-        assert_eq!(layout.start_sector, 0);
-        assert_eq!(layout.copies, 1);
-        assert!(!layout.wrapping_address);
+        let layout = RawMode::Command.layout(StorageType::Emmc);
+        assert_eq!(layout.start_sector, 0xffff_6000);
+        assert_eq!(layout.copies, 4);
+        assert!(layout.wrapping_address);
+        assert_eq!(RawMode::physical_start_sector(layout), 0);
+        assert_eq!(
+            (layout.start_sector as u32).wrapping_add(FES_SDMMC_LOGICAL_OFFSET_SECTORS),
+            0
+        );
+        let spinor_layout = RawMode::Command.layout(StorageType::Spinor);
+        assert_eq!(spinor_layout.start_sector, 0);
+        assert!(!spinor_layout.wrapping_address);
         assert_eq!(RAW_READ_WINDOW_SIZE, 10 * 1024 * 1024);
         assert_eq!(RAW_READ_WINDOW_SIZE % SECTOR_SIZE as usize, 0);
     }
@@ -694,6 +839,63 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("RAW_TARGET_STORAGE_UNKNOWN"));
+    }
+
+    fn test_mainline_spl() -> Vec<u8> {
+        let mut spl = vec![0_u8; 0xc000];
+        spl[4..12].copy_from_slice(b"eGON.BT0");
+        spl[0x0c..0x10].copy_from_slice(&0x5f0a_6c39_u32.to_le_bytes());
+        let length = spl.len() as u32;
+        spl[0x10..0x14].copy_from_slice(&length.to_le_bytes());
+        spl[0x14..0x18].copy_from_slice(b"SPL\x02");
+        let checksum = spl.chunks_exact(4).fold(0_u32, |sum, word| {
+            sum.wrapping_add(u32::from_le_bytes(word.try_into().unwrap()))
+        });
+        spl[0x0c..0x10].copy_from_slice(&checksum.to_le_bytes());
+        spl
+    }
+
+    #[test]
+    fn extracts_only_a_checksum_valid_mainline_spl_at_the_emmc_boot_offset() {
+        let spl = test_mainline_spl();
+        let mut image = vec![0_u8; MAINLINE_SPL_DISK_OFFSET as usize];
+        image.extend_from_slice(&spl);
+        image.resize(2 * 1024 * 1024, 0);
+        let path = std::env::temp_dir().join(format!(
+            "openix-emmc-boot0-{}-{}.img",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, &image).unwrap();
+        assert_eq!(
+            extract_mainline_spl(&path, image.len() as u64).unwrap(),
+            spl
+        );
+
+        image[MAINLINE_SPL_DISK_OFFSET as usize + 0x100] ^= 0x80;
+        std::fs::write(&path, &image).unwrap();
+        assert!(extract_mainline_spl(&path, image.len() as u64)
+            .unwrap_err()
+            .to_string()
+            .contains("EMMC_BOOT0_SPL_CHECKSUM_INVALID"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn emmc_boot0_route_rejects_non_emmc_media() {
+        for storage in [StorageType::Emmc, StorageType::Emmc3, StorageType::Emmc0] {
+            assert!(is_emmc_storage(storage));
+        }
+        for storage in [
+            StorageType::Sdcard,
+            StorageType::Sd1,
+            StorageType::Ufs,
+            StorageType::Spinor,
+            StorageType::Nand,
+            StorageType::Spinand,
+        ] {
+            assert!(!is_emmc_storage(storage));
+        }
     }
 
     #[test]

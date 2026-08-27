@@ -63,8 +63,8 @@ impl FlashStages {
             StageType::FelDram,
             StageType::FelUboot,
             StageType::FelReconnect,
-            StageType::FesErase,
             StageType::FesQuery,
+            StageType::FesErase,
             StageType::FesMbr,
             StageType::FesPartitions,
             StageType::FesMode,
@@ -77,8 +77,8 @@ impl FlashStages {
         let mut instance = Self::new();
         instance.stages = vec![
             StageType::Init,
-            StageType::FesErase,
             StageType::FesQuery,
+            StageType::FesErase,
             StageType::FesMbr,
             StageType::FesPartitions,
             StageType::FesMode,
@@ -95,5 +95,33 @@ impl FlashStages {
 impl Default for FlashStages {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_stage_order_matches_non_destructive_preflight_before_erase() {
+        for stages in [
+            FlashStages::for_raw_fel_mode(),
+            FlashStages::for_raw_fes_mode(),
+        ] {
+            let query = stages
+                .stages
+                .iter()
+                .position(|stage| *stage == StageType::FesQuery)
+                .expect("raw flow has storage/capacity query");
+            let erase = stages
+                .stages
+                .iter()
+                .position(|stage| *stage == StageType::FesErase)
+                .expect("raw flow has erase policy");
+            assert!(
+                query < erase,
+                "query must complete before destructive erase"
+            );
+        }
     }
 }

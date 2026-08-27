@@ -167,7 +167,7 @@ impl GlobalProgress {
 
         let mut cumulative_percent = 0u64;
         for stage_type in stage_types {
-            let end_percent = match stage_type {
+            let end_percent: u64 = match stage_type {
                 StageType::Init => 3,
                 StageType::FelDram => 5,
                 StageType::FelUboot => 8,
@@ -181,7 +181,10 @@ impl GlobalProgress {
             };
             stages.push(StageInfo {
                 stage_type: *stage_type,
-                weight: end_percent - cumulative_percent,
+                // Stage definitions are expected to be monotonic, but progress
+                // reporting must never panic before a hardware operation when a
+                // caller supplies an invalid sequence.
+                weight: end_percent.saturating_sub(cumulative_percent),
                 completed: false,
                 sub_total: 0,
             });

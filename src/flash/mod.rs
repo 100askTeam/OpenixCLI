@@ -458,7 +458,7 @@ impl Flasher {
                 }
                 if actual_device_id != expected_device_id {
                     self.logger.info(&format!(
-                        "FES_RECONNECT_DEVICE_ID_MAPPING fel=0x{expected_device_id:08x} fes=0x{actual_device_id:08x} rule=r528-vendor-fes-v1"
+                        "FES_RECONNECT_DEVICE_ID_MAPPING fel=0x{expected_device_id:08x} fes=0x{actual_device_id:08x} rule=allwinner-vendor-fes-v1"
                     ));
                 }
 
@@ -604,7 +604,12 @@ fn is_allwinner_fel_fes_usb(device: &libefex::ScannedDevice) -> bool {
 
 fn fel_fes_device_ids_match(fel_device_id: u32, fes_device_id: u32) -> bool {
     fel_device_id == fes_device_id
-        || matches!((fel_device_id, fes_device_id), (0x0018_5900, 0x0016_1000))
+        || matches!(
+            (fel_device_id, fes_device_id),
+            // R528/T113S3 and T527/A523 both re-enumerate with the vendor
+            // FES service's generic device ID after their board loader runs.
+            (0x0018_5900, 0x0016_1000) | (0x0018_9000, 0x0016_1000)
+        )
 }
 
 fn same_libusb_bus_and_leaf(expected: &str, candidate: &str) -> bool {
@@ -762,5 +767,13 @@ mod location_tests {
         assert!(fel_fes_device_ids_match(0x0018_5900, 0x0018_5900));
         assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_5900));
         assert!(!fel_fes_device_ids_match(0x0018_5900, 0x0016_1001));
+    }
+
+    #[test]
+    fn t527_bootrom_to_vendor_fes_is_a_one_way_explicit_mapping() {
+        assert!(fel_fes_device_ids_match(0x0018_9000, 0x0016_1000));
+        assert!(fel_fes_device_ids_match(0x0018_9000, 0x0018_9000));
+        assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_9000));
+        assert!(!fel_fes_device_ids_match(0x0018_9000, 0x0016_1001));
     }
 }

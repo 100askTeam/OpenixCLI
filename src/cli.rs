@@ -49,7 +49,7 @@ pub enum Commands {
     /// raw image using the selected raw layout.
     Raw {
         /// Board-matched IMAGEWTY loader used only for RAM DRAM/FES bootstrap.
-        #[arg(help = "RAM-only board loader; this file is never written to NAND")]
+        #[arg(help = "RAM-only board loader; this file is never written to target storage")]
         loader: String,
 
         /// Sector-aligned whole-disk raw image written after FES is ready.
@@ -59,6 +59,11 @@ pub enum Commands {
         /// Raw disk layout. Command mode always starts at sector 0.
         #[arg(long, value_enum, default_value = "command")]
         mode: RawMode,
+
+        /// Extract a checksum-valid mainline SPL from the standard 8 KiB
+        /// offset in the raw image and install it through FES Boot0 semantics.
+        #[arg(long)]
+        emmc_boot0_from_image: bool,
 
         #[arg(short, long)]
         bus: Option<u8>,
@@ -83,6 +88,11 @@ pub enum Commands {
             help = "Flash a raw whole-disk image to sector 0 through the FES service"
         )]
         raw: bool,
+
+        /// For an eMMC raw image, extract the mainline SPL at 8 KiB and write
+        /// it to hardware Boot0 before the raw user-area write and verification.
+        #[arg(long, requires = "raw")]
+        emmc_boot0_from_image: bool,
 
         /// Trusted board-matched vendor package used only to initialize DRAM
         /// and boot the RAM FES service. Its partitions are never written.
@@ -252,10 +262,11 @@ mod tests {
         let cli = Cli::try_parse_from([
             "openixcli",
             "raw",
-            "t113s3-loader.bin",
-            "mainline-spinand-logical.raw",
+            "avaota-a1-loader.img",
+            "avaota-a1-full-mainline.img",
             "--mode",
             "command",
+            "--emmc-boot0-from-image",
             "--bus",
             "0",
             "--port",
@@ -269,10 +280,12 @@ mod tests {
                 ref loader,
                 ref firmware,
                 mode: RawMode::Command,
+                emmc_boot0_from_image: true,
                 bus: Some(0),
                 port: Some(2),
                 ..
-            }) if loader == "t113s3-loader.bin" && firmware == "mainline-spinand-logical.raw"
+            }) if loader == "avaota-a1-loader.img"
+                && firmware == "avaota-a1-full-mainline.img"
         ));
     }
 

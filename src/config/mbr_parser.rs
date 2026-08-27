@@ -12,6 +12,8 @@ pub const MBR_MAGIC: &str = "softw411";
 pub const MBR_VERSION: u32 = 0x00000200;
 /// MBR size in bytes (16KB)
 pub const MBR_SIZE: usize = 16 * 1024;
+/// Number of redundant MBR records required by the vendor FES protocol.
+pub const MBR_COPY_NUM: usize = 4;
 /// Maximum partition name length
 pub const PART_NAME_MAX_LEN: usize = 16;
 /// Reserved size in partition entry
@@ -37,27 +39,31 @@ pub fn build_generic_raw_mbr(
         return Err("Raw partition must contain at least one sector");
     }
 
-    let mut mbr = vec![0_u8; MBR_SIZE];
-    write_u32(&mut mbr, 4, MBR_VERSION);
-    mbr[8..16].copy_from_slice(MBR_MAGIC.as_bytes());
-    write_u32(&mut mbr, 16, 1); // one MBR copy
-    write_u32(&mut mbr, 20, 0); // copy index
-    write_u32(&mut mbr, 24, 1); // one partition
+    let mut record = vec![0_u8; MBR_SIZE];
+    write_u32(&mut record, 4, MBR_VERSION);
+    record[8..16].copy_from_slice(MBR_MAGIC.as_bytes());
+    write_u32(&mut record, 16, MBR_COPY_NUM as u32);
+    write_u32(&mut record, 24, 1); // one partition
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as u32)
         .unwrap_or(0);
-    write_u32(&mut mbr, 28, stamp);
+    write_u32(&mut record, 28, stamp);
 
     let partition = MBR_HEADER_SIZE;
-    write_u64_halves(&mut mbr, partition, start_sector);
-    write_u64_halves(&mut mbr, partition + 8, sector_count);
-    write_name(&mut mbr, partition + 16, "DISK");
-    write_name(&mut mbr, partition + 32, "raw");
+    write_u64_halves(&mut record, partition, start_sector);
+    write_u64_halves(&mut record, partition + 8, sector_count);
+    write_name(&mut record, partition + 16, "DISK");
+    write_name(&mut record, partition + 32, "raw");
     debug_assert_eq!(PARTITION_ENTRY_SIZE, SUNXI_PARTITION_SIZE);
 
-    let crc = sunxi_mbr_crc32(&mbr[4..]);
-    write_u32(&mut mbr, 0, crc);
+    let mut mbr = Vec::with_capacity(MBR_SIZE * MBR_COPY_NUM);
+    for index in 0..MBR_COPY_NUM {
+        write_u32(&mut record, 20, index as u32);
+        let crc = sunxi_mbr_crc32(&record[4..]);
+        write_u32(&mut record, 0, crc);
+        mbr.extend_from_slice(&record);
+    }
     Ok(mbr)
 }
 
@@ -313,12 +319,12 @@ mod tests {
     fn generic_raw_mbr_matches_fes_single_partition_contract() {
         let sectors = 56_832;
         let bytes = build_generic_raw_mbr(0, sectors).unwrap();
-        assert_eq!(bytes.len(), MBR_SIZE);
+        assert_eq!(bytes.len(), MBR_SIZE * MBR_COPY_NUM);
 
         let parsed = SunxiMbr::parse(&bytes).unwrap();
         assert_eq!(parsed.version, MBR_VERSION);
         assert_eq!(parsed.magic, MBR_MAGIC);
-        assert_eq!(parsed.copy, 1);
+        assert_eq!(parsed.copy, MBR_COPY_NUM as u32);
         assert_eq!(parsed.index, 0);
         assert_eq!(parsed.part_count, 1);
         assert_eq!(parsed.partitions.len(), 1);
@@ -327,8 +333,16 @@ mod tests {
         assert_eq!(parsed.partitions[0].address(), 0);
         assert_eq!(parsed.partitions[0].length(), sectors);
 
-        let stored_crc = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(stored_crc, reference_crc32(&bytes[4..]));
+        for index in 0..MBR_COPY_NUM {
+            let record = &bytes[index * MBR_SIZE..(index + 1) * MBR_SIZE];
+            let parsed = SunxiMbr::parse(record).unwrap();
+            assert_eq!(parsed.copy, MBR_COPY_NUM as u32);
+            assert_eq!(parsed.index, index as u32);
+            assert_eq!(parsed.partitions[0].address(), 0);
+            assert_eq!(parsed.partitions[0].length(), sectors);
+            let stored_crc = u32::from_le_bytes(record[0..4].try_into().unwrap());
+            assert_eq!(stored_crc, reference_crc32(&record[4..]));
+        }
     }
 
     #[test]

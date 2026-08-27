@@ -56,6 +56,7 @@ pub async fn execute(args: FlashArgs) -> anyhow::Result<()> {
                     baud: args.storage_geometry_serial_baud,
                 }),
             args.raw_mode,
+            args.emmc_boot0_from_image,
             request,
             logger.clone(),
         );

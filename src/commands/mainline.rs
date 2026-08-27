@@ -535,7 +535,6 @@ fn verify_r528_spl_return<T: FelTransport>(transport: &T) -> anyhow::Result<()> 
 enum EndpointSelector<'a> {
     DevicePath(&'a str),
     DeviceLocation(&'a str),
-    BusPort { bus: u8, port: u8 },
 }
 
 fn validated_endpoint_selector<'a>(
@@ -554,14 +553,16 @@ fn validated_endpoint_selector<'a>(
         })
         .collect::<Vec<_>>();
     match location_matches.as_slice() {
-        [device] if device.bus == bus && device.port == port => Ok(match device
-            .device_path
-            .as_deref()
-            .filter(|path| !path.is_empty() && !path.starts_with("libusb:"))
-        {
-            Some(path) => EndpointSelector::DevicePath(path),
-            None => EndpointSelector::DeviceLocation(device_location),
-        }),
+        [device] if device.bus == bus && device.port == port => Ok(
+            match device
+                .device_path
+                .as_deref()
+                .filter(|path| !path.is_empty() && !path.starts_with("libusb:"))
+            {
+                Some(path) => EndpointSelector::DevicePath(path),
+                None => EndpointSelector::DeviceLocation(device_location),
+            },
+        ),
         [_, _, ..] => {
             bail!("FLASH_TARGET_LOCATION_AMBIGUOUS:bound physical location is not unique")
         }
@@ -588,14 +589,16 @@ fn reconnected_endpoint_selector<'a>(
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [device] => Ok(Some(match device
-            .device_path
-            .as_deref()
-            .filter(|path| !path.is_empty() && !path.starts_with("libusb:"))
-        {
-            Some(path) => EndpointSelector::DevicePath(path),
-            None => EndpointSelector::DeviceLocation(device_location),
-        })),
+        [device] => Ok(Some(
+            match device
+                .device_path
+                .as_deref()
+                .filter(|path| !path.is_empty() && !path.starts_with("libusb:"))
+            {
+                Some(path) => EndpointSelector::DevicePath(path),
+                None => EndpointSelector::DeviceLocation(device_location),
+            },
+        )),
         [_, _, ..] => {
             bail!("MAINLINE_SPL_RETURN_LOCATION_AMBIGUOUS:physical location is not unique")
         }
@@ -633,7 +636,6 @@ fn reconnect_mainline_fel(
             EndpointSelector::DeviceLocation(location) => {
                 context.scan_usb_device_by_location(location)
             }
-            EndpointSelector::BusPort { bus, port } => context.scan_usb_device_at(bus, port),
         };
         if let Err(error) = selected {
             last_error = format!("endpoint selection failed: {error}");
@@ -702,9 +704,6 @@ pub fn execute(
         EndpointSelector::DeviceLocation(location) => context
             .scan_usb_device_by_location(location)
             .context("FLASH_TARGET_REENUMERATED:physical location disappeared before open")?,
-        EndpointSelector::BusPort { bus, port } => context
-            .scan_usb_device_at(bus, port)
-            .context("FLASH_TARGET_REENUMERATED:current endpoint disappeared before open")?,
     }
     emit(jsonl, json!({"event":"phase","phase":"opening_device"}));
     context.usb_init()?;
