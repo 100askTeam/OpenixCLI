@@ -268,16 +268,27 @@ impl Flasher {
                     )
                     .map_err(|error| FlashError::UsbTransferError(error.to_string()))
             });
-            if let Err(error) = retry {
-                self.logger.post_action(
-                    self.request.post_action,
-                    "failed",
-                    2,
-                    Some(error.to_string()),
-                );
-                return Err(error);
-            }
-            if !self.wait_for_fes_exit().await {
+            let retry_succeeded = match retry {
+                Ok(()) => true,
+                Err(error) => {
+                    if post_action_retry_open_error_is_success(self.wait_for_fes_exit().await) {
+                        self.logger.info(concat!(
+                            "POST_FLASH_ACTION_CONFIRMED_BY_FES_EXIT ",
+                            "retry device disappeared after the mode switch"
+                        ));
+                        false
+                    } else {
+                        self.logger.post_action(
+                            self.request.post_action,
+                            "failed",
+                            2,
+                            Some(error.to_string()),
+                        );
+                        return Err(error);
+                    }
+                }
+            };
+            if retry_succeeded && !self.wait_for_fes_exit().await {
                 let message = format!(
                     "POST_FLASH_ACTION_FAILED:{} device remained in FEL/FES",
                     self.request.post_action
@@ -606,9 +617,9 @@ fn fel_fes_device_ids_match(fel_device_id: u32, fes_device_id: u32) -> bool {
     fel_device_id == fes_device_id
         || matches!(
             (fel_device_id, fes_device_id),
-            // R528/T113S3 and T527/A523 both re-enumerate with the vendor
+            // A133, R528/T113S3 and T527/A523 re-enumerate with the vendor
             // FES service's generic device ID after their board loader runs.
-            (0x0018_5900, 0x0016_1000) | (0x0018_9000, 0x0016_1000)
+            (0x0018_5500, 0x0016_1000) | (0x0018_5900, 0x0016_1000) | (0x0018_9000, 0x0016_1000)
         )
 }
 
@@ -646,11 +657,16 @@ fn same_libusb_bus(expected: &str, candidate: &str) -> bool {
     expected_bus == candidate_bus
 }
 
+fn post_action_retry_open_error_is_success(fes_exited: bool) -> bool {
+    fes_exited
+}
+
 #[cfg(test)]
 mod location_tests {
     use super::{
         fel_fes_device_ids_match, format_device_snapshot, locations_match,
-        reconnect_location_candidates, same_libusb_bus, same_libusb_bus_and_leaf,
+        post_action_retry_open_error_is_success, reconnect_location_candidates, same_libusb_bus,
+        same_libusb_bus_and_leaf,
     };
 
     fn scanned(location: &str) -> libefex::ScannedDevice {
@@ -770,10 +786,24 @@ mod location_tests {
     }
 
     #[test]
+    fn a133_bootrom_to_vendor_fes_is_a_one_way_explicit_mapping() {
+        assert!(fel_fes_device_ids_match(0x0018_5500, 0x0016_1000));
+        assert!(fel_fes_device_ids_match(0x0018_5500, 0x0018_5500));
+        assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_5500));
+        assert!(!fel_fes_device_ids_match(0x0018_5500, 0x0016_1001));
+    }
+
+    #[test]
     fn t527_bootrom_to_vendor_fes_is_a_one_way_explicit_mapping() {
         assert!(fel_fes_device_ids_match(0x0018_9000, 0x0016_1000));
         assert!(fel_fes_device_ids_match(0x0018_9000, 0x0018_9000));
         assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_9000));
         assert!(!fel_fes_device_ids_match(0x0018_9000, 0x0016_1001));
+    }
+
+    #[test]
+    fn post_action_retry_open_error_requires_confirmed_fes_exit() {
+        assert!(post_action_retry_open_error_is_success(true));
+        assert!(!post_action_retry_open_error_is_success(false));
     }
 }
