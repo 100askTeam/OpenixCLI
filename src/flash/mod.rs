@@ -28,6 +28,8 @@ struct BootstrapArtifacts {
     board_config: Option<Vec<u8>>,
 }
 
+const ALLWINNER_VENDOR_FES_DEVICE_ID: u32 = 0x0016_1000;
+
 /// Main flash controller
 ///
 /// Coordinates the flashing process including FEL initialization,
@@ -469,7 +471,7 @@ impl Flasher {
                 }
                 if actual_device_id != expected_device_id {
                     self.logger.info(&format!(
-                        "FES_RECONNECT_DEVICE_ID_MAPPING fel=0x{expected_device_id:08x} fes=0x{actual_device_id:08x} rule=allwinner-vendor-fes-v1"
+                        "FES_RECONNECT_DEVICE_ID_MAPPING fel=0x{expected_device_id:08x} fes=0x{actual_device_id:08x} rule=generic-fes-protocol-id-v1"
                     ));
                 }
 
@@ -582,6 +584,23 @@ fn reconnect_location_candidates<'a>(
         return (exact, None);
     }
 
+    if is_windows_physical_location(expected) {
+        let libusb = devices
+            .iter()
+            .filter(|device| {
+                is_allwinner_fel_fes_usb(device)
+                    && device
+                        .location_path
+                        .as_deref()
+                        .is_some_and(|candidate| candidate.starts_with("libusb:"))
+            })
+            .collect::<Vec<_>>();
+        return (
+            libusb,
+            Some("windows-location-to-unique-libusb-fes-transition"),
+        );
+    }
+
     let same_leaf = devices
         .iter()
         .filter(|device| {
@@ -614,13 +633,19 @@ fn is_allwinner_fel_fes_usb(device: &libefex::ScannedDevice) -> bool {
 }
 
 fn fel_fes_device_ids_match(fel_device_id: u32, fes_device_id: u32) -> bool {
-    fel_device_id == fes_device_id
-        || matches!(
-            (fel_device_id, fes_device_id),
-            // A133, R528/T113S3 and T527/A523 re-enumerate with the vendor
-            // FES service's generic device ID after their board loader runs.
-            (0x0018_5500, 0x0016_1000) | (0x0018_5900, 0x0016_1000) | (0x0018_9000, 0x0016_1000)
-        )
+    // The vendor service reports one protocol-state ID after the board's
+    // loader starts. It does not identify a particular SoC. Device ownership
+    // is established separately by the unique USB topology candidate and the
+    // Allwinner VID/PID, then confirmed by the Srv-mode handshake.
+    fel_device_id == fes_device_id || fes_device_id == ALLWINNER_VENDOR_FES_DEVICE_ID
+}
+
+fn is_windows_physical_location(location: &str) -> bool {
+    let location = location
+        .strip_prefix("windows:")
+        .unwrap_or(location)
+        .to_ascii_lowercase();
+    location.starts_with("pciroot(") && location.contains("#usbroot(") && location.contains("#usb(")
 }
 
 fn same_libusb_bus_and_leaf(expected: &str, candidate: &str) -> bool {
@@ -778,27 +803,42 @@ mod location_tests {
     }
 
     #[test]
-    fn r528_bootrom_to_vendor_fes_is_a_one_way_explicit_mapping() {
-        assert!(fel_fes_device_ids_match(0x0018_5900, 0x0016_1000));
-        assert!(fel_fes_device_ids_match(0x0018_5900, 0x0018_5900));
-        assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_5900));
-        assert!(!fel_fes_device_ids_match(0x0018_5900, 0x0016_1001));
+    fn windows_location_migrates_only_to_the_unique_libusb_fes_candidate() {
+        let expected = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(4)";
+        let devices = vec![scanned("libusb:2:4.1")];
+        let (matching, rule) = reconnect_location_candidates(expected, &devices);
+        assert_eq!(
+            rule,
+            Some("windows-location-to-unique-libusb-fes-transition")
+        );
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].location_path.as_deref(), Some("libusb:2:4.1"));
     }
 
     #[test]
-    fn a133_bootrom_to_vendor_fes_is_a_one_way_explicit_mapping() {
-        assert!(fel_fes_device_ids_match(0x0018_5500, 0x0016_1000));
-        assert!(fel_fes_device_ids_match(0x0018_5500, 0x0018_5500));
-        assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_5500));
-        assert!(!fel_fes_device_ids_match(0x0018_5500, 0x0016_1001));
+    fn windows_location_rejects_ambiguous_libusb_fes_candidates() {
+        let expected = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(4)";
+        let devices = vec![scanned("libusb:2:4.1"), scanned("libusb:3:7.2")];
+        let (matching, rule) = reconnect_location_candidates(expected, &devices);
+        assert_eq!(
+            rule,
+            Some("windows-location-to-unique-libusb-fes-transition")
+        );
+        assert_eq!(matching.len(), 2);
     }
 
     #[test]
-    fn t527_bootrom_to_vendor_fes_is_a_one_way_explicit_mapping() {
-        assert!(fel_fes_device_ids_match(0x0018_9000, 0x0016_1000));
-        assert!(fel_fes_device_ids_match(0x0018_9000, 0x0018_9000));
-        assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_9000));
-        assert!(!fel_fes_device_ids_match(0x0018_9000, 0x0016_1001));
+    fn generic_vendor_fes_id_accepts_any_fel_soc_without_a_chip_whitelist() {
+        for fel_device_id in [0x0018_2300, 0x0018_5500, 0x0018_5900, 0x0018_9000] {
+            assert!(fel_fes_device_ids_match(fel_device_id, 0x0016_1000));
+            assert!(fel_fes_device_ids_match(fel_device_id, fel_device_id));
+        }
+    }
+
+    #[test]
+    fn generic_vendor_fes_id_transition_is_one_way_and_rejects_other_id_changes() {
+        assert!(!fel_fes_device_ids_match(0x0016_1000, 0x0018_2300));
+        assert!(!fel_fes_device_ids_match(0x0018_2300, 0x0016_1001));
     }
 
     #[test]
