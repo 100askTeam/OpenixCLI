@@ -26,7 +26,7 @@ mod utils;
 /// CLI structure parsed from command line arguments
 use cli::{Cli, Commands, OutputFormat};
 use commands::{parse_partition_list, FlashArgs};
-use flash::{FlashMode, PostAction, RawMode};
+use flash::{FlashMode, RawMode};
 use utils::TermLogger;
 
 const RAW_GEOMETRY_SERIAL_PORT_ENV: &str = "OPENIXCLI_STORAGE_GEOMETRY_SERIAL_PORT";
@@ -91,6 +91,24 @@ async fn main() -> anyhow::Result<()> {
             setup_logging(cli.verbose);
             commands::scan::execute(detailed).await?;
         }
+        Some(Commands::SpinorReadback {
+            ram_loader,
+            initialize_window,
+            device_location,
+            report,
+            dump,
+            length,
+        }) => {
+            commands::physical_readback::execute(
+                &device_location,
+                std::path::Path::new(&report),
+                dump.as_deref().map(std::path::Path::new),
+                length,
+                initialize_window,
+                ram_loader.as_deref().map(std::path::Path::new),
+            )
+            .await?;
+        }
         Some(Commands::Flash {
             firmware,
             raw,
@@ -135,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
             loader,
             firmware,
             mode,
+            post_action,
             emmc_boot0_from_image,
             bus,
             port,
@@ -158,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 verify: true,
                 mode: command_raw_fes_policy(),
                 partitions: None,
-                post_action: PostAction::None,
+                post_action,
                 verbose: cli.verbose,
                 jsonl: cli.output == OutputFormat::Jsonl,
             };

@@ -60,6 +60,11 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "command")]
         mode: RawMode,
 
+        /// Action after a successful raw write and verification. Keep the
+        /// existing no-action default unless the caller explicitly requests one.
+        #[arg(short = 'a', long, default_value = "none")]
+        post_action: PostAction,
+
         /// Extract a checksum-valid mainline SPL from the standard 8 KiB
         /// offset in the raw image and install it through FES Boot0 semantics.
         #[arg(long)]
@@ -73,6 +78,28 @@ pub enum Commands {
 
         #[arg(long)]
         device_location: Option<String>,
+    },
+
+    /// Read F101 NOR through a physical XIP window. Never erases or reboots.
+    SpinorReadback {
+        /// Load the fingerprinted F101 vendor RAM service before physical diagnostics.
+        #[arg(long)]
+        ram_loader: Option<String>,
+        /// Explicitly configure and restore a physical read window in F101 ROM FEL.
+        /// Changes controller registers; does not write flash. Default is passive.
+        #[arg(long)]
+        initialize_window: bool,
+        #[arg(long)]
+        device_location: String,
+        /// New JSON evidence file; never overwrite previous evidence.
+        #[arg(long)]
+        report: String,
+        /// New binary output. Omit to check physical-read readiness only.
+        #[arg(long)]
+        dump: Option<String>,
+        /// Bytes from physical zero (decimal; maximum 16 MiB for this profile).
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        length: u32,
     },
 
     /// Flash firmware to device
@@ -228,6 +255,96 @@ pub enum Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_accepts_explicit_spinor_route_with_completion_action() {
+        let cli = Cli::try_parse_from([
+            "openixcli",
+            "raw",
+            "loader.img",
+            "nekobox-full.img",
+            "--mode",
+            "spinor-physical",
+            "--post-action",
+            "reboot",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Raw {
+                mode: RawMode::SpinorPhysical,
+                post_action: PostAction::Reboot,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn physical_readback_requires_exact_scope_and_rejects_destructive_flags() {
+        let base = [
+            "openixcli",
+            "spinor-readback",
+            "--device-location",
+            "usb-bound",
+            "--report",
+            "evidence.json",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(base).unwrap().command,
+            Some(Commands::SpinorReadback { .. })
+        ));
+        assert!(
+            Cli::try_parse_from(["openixcli", "spinor-readback", "--report", "evidence.json"])
+                .is_err()
+        );
+        let mut destructive = base.to_vec();
+        destructive.extend(["--post-action", "reboot"]);
+        assert!(Cli::try_parse_from(destructive).is_err());
+    }
+
+    #[test]
+    fn raw_accepts_explicit_post_actions() {
+        for (action, expected) in [
+            ("none", PostAction::None),
+            ("reboot", PostAction::Reboot),
+            ("poweroff", PostAction::PowerOff),
+            ("shutdown", PostAction::Shutdown),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "openixcli",
+                "raw",
+                "loader.img",
+                "disk.img",
+                "--post-action",
+                action,
+            ])
+            .expect("explicit raw post action");
+            assert!(
+                matches!(parsed.command, Some(Commands::Raw { post_action, .. }) if post_action == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn raw_defaults_to_no_post_action_and_rejects_invalid_actions() {
+        let cli = Cli::try_parse_from(["openixcli", "raw", "loader.img", "disk.img"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Raw {
+                post_action: PostAction::None,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "openixcli",
+            "raw",
+            "loader.img",
+            "disk.img",
+            "--post-action",
+            "invalid"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn parses_jsonl_output_for_flash_automation() {

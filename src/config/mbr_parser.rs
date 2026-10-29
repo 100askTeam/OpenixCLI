@@ -12,7 +12,7 @@ pub const MBR_MAGIC: &str = "softw411";
 pub const MBR_VERSION: u32 = 0x00000200;
 /// MBR size in bytes (16KB)
 pub const MBR_SIZE: usize = 16 * 1024;
-/// Number of redundant MBR records required by the vendor FES protocol.
+/// Default redundant record count; SPI NOR uses a single record.
 pub const MBR_COPY_NUM: usize = 4;
 /// Maximum partition name length
 pub const PART_NAME_MAX_LEN: usize = 16;
@@ -35,6 +35,19 @@ pub fn build_generic_raw_mbr(
     start_sector: u64,
     sector_count: u64,
 ) -> Result<Vec<u8>, &'static str> {
+    build_raw_mbr_with_copies(start_sector, sector_count, MBR_COPY_NUM)
+}
+
+/// Build the raw partition table for the selected FES media contract.
+/// NOR requires one 16 KiB record; existing other media use four records.
+pub fn build_raw_mbr_with_copies(
+    start_sector: u64,
+    sector_count: u64,
+    copy_count: usize,
+) -> Result<Vec<u8>, &'static str> {
+    if !matches!(copy_count, 1 | MBR_COPY_NUM) {
+        return Err("Raw MBR must contain one or four copies");
+    }
     if sector_count == 0 {
         return Err("Raw partition must contain at least one sector");
     }
@@ -42,7 +55,7 @@ pub fn build_generic_raw_mbr(
     let mut record = vec![0_u8; MBR_SIZE];
     write_u32(&mut record, 4, MBR_VERSION);
     record[8..16].copy_from_slice(MBR_MAGIC.as_bytes());
-    write_u32(&mut record, 16, MBR_COPY_NUM as u32);
+    write_u32(&mut record, 16, copy_count as u32);
     write_u32(&mut record, 24, 1); // one partition
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,8 +70,8 @@ pub fn build_generic_raw_mbr(
     write_name(&mut record, partition + 32, "raw");
     debug_assert_eq!(PARTITION_ENTRY_SIZE, SUNXI_PARTITION_SIZE);
 
-    let mut mbr = Vec::with_capacity(MBR_SIZE * MBR_COPY_NUM);
-    for index in 0..MBR_COPY_NUM {
+    let mut mbr = Vec::with_capacity(MBR_SIZE * copy_count);
+    for index in 0..copy_count {
         write_u32(&mut record, 20, index as u32);
         let crc = sunxi_mbr_crc32(&record[4..]);
         write_u32(&mut record, 0, crc);
@@ -348,5 +361,37 @@ mod tests {
     #[test]
     fn generic_raw_mbr_rejects_empty_partition() {
         assert!(build_generic_raw_mbr(0, 0).is_err());
+    }
+
+    #[test]
+    fn selected_copy_count_preserves_headers_partition_and_each_crc() {
+        for copies in [1, 4] {
+            let bytes = build_raw_mbr_with_copies(0x1_0000_0002, 0x2_0000_0003, copies).unwrap();
+            assert_eq!(bytes.len(), 16_384 * copies);
+            for (index, record) in bytes.chunks_exact(16_384).enumerate() {
+                let mbr = SunxiMbr::parse(record).unwrap();
+                assert_eq!(mbr.copy, copies as u32);
+                assert_eq!(mbr.index, index as u32);
+                assert_eq!(mbr.part_count, 1);
+                assert_eq!(mbr.partitions[0].name, "raw");
+                assert_eq!(mbr.partitions[0].classname, "DISK");
+                assert_eq!(mbr.partitions[0].address(), 0x1_0000_0002);
+                assert_eq!(mbr.partitions[0].length(), 0x2_0000_0003);
+                assert_eq!(
+                    u32::from_le_bytes(record[..4].try_into().unwrap()),
+                    reference_crc32(&record[4..])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_copy_count_rejects_invalid_contracts_before_allocating() {
+        for copies in [0, 2, 3, 5, usize::MAX] {
+            assert!(build_raw_mbr_with_copies(0, 9552, copies).is_err());
+        }
+        for copies in [1, 4] {
+            assert!(build_raw_mbr_with_copies(0, 0, copies).is_err());
+        }
     }
 }

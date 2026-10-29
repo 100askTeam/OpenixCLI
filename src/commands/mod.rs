@@ -10,3 +10,5 @@ pub mod types;
 pub mod unpack;
 
 pub use types::{parse_partition_list, FlashArgs, UnpackArgs};
+
+pub mod physical_readback;

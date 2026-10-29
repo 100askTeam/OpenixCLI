@@ -11,7 +11,7 @@ use std::time::Duration;
 use libefex::FesDataType;
 use sha2::{Digest, Sha256};
 
-use crate::config::mbr_parser::{build_generic_raw_mbr, EFEX_CRC32_VALID_FLAG};
+use crate::config::mbr_parser::{build_raw_mbr_with_copies, EFEX_CRC32_VALID_FLAG};
 use crate::firmware::{OpenixPacker, StorageType};
 use crate::flash::fes_handler::{IncrementalChecksum, MbrDownload};
 use crate::flash::{FlashRequest, Flasher, PostAction};
@@ -34,6 +34,9 @@ const FES_BOOT0_VERIFY_TAG: u32 = 0x7f03;
 pub enum RawMode {
     /// Treat the input as a whole-disk command image beginning at sector 0.
     Command,
+    /// Physical SPI NOR image using a fingerprinted, runtime-verified loader
+    /// contract and independent readback. Unknown loaders remain blocked.
+    SpinorPhysical,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,10 +46,16 @@ struct RawLayout {
     wrapping_address: bool,
 }
 
+impl RawLayout {
+    fn build_mbr(self, sector_count: u64) -> Result<Vec<u8>, &'static str> {
+        build_raw_mbr_with_copies(self.start_sector, sector_count, self.copies as usize)
+    }
+}
+
 impl RawMode {
     const fn layout(self, storage_type: StorageType) -> RawLayout {
         match self {
-            Self::Command => {
+            Self::Command | Self::SpinorPhysical => {
                 let sdmmc = matches!(
                     storage_type,
                     StorageType::Emmc
@@ -61,7 +70,11 @@ impl RawMode {
                     } else {
                         0
                     },
-                    copies: crate::config::mbr_parser::MBR_COPY_NUM as u32,
+                    copies: if matches!(storage_type, StorageType::Spinor) {
+                        1
+                    } else {
+                        crate::config::mbr_parser::MBR_COPY_NUM as u32
+                    },
                     wrapping_address: sdmmc,
                 }
             }
@@ -190,6 +203,10 @@ impl RawDiskFlasher {
         }
         self.logger
             .info(&format!("RAW_TARGET_STORAGE:{storage_type}"));
+        if self.raw_mode == RawMode::SpinorPhysical && storage_type == StorageType::Spinor {
+            return self.execute_spinor_physical(&ctx).await;
+        }
+        validate_raw_address_contract(self.raw_mode, storage_type)?;
 
         self.logger.info("RAW_PREFLIGHT_STAGE:probe_capacity");
         let probed_sectors = ctx
@@ -264,7 +281,8 @@ impl RawDiskFlasher {
         self.logger.complete_stage();
 
         ensure_not_cancelled()?;
-        let mbr_data = build_generic_raw_mbr(raw_layout.start_sector, image_sectors)
+        let mbr_data = raw_layout
+            .build_mbr(image_sectors)
             .map_err(|error| FlashError::InvalidFirmwareFormat(error.to_owned()))?;
         self.logger.begin_stage(crate::process::StageType::FesMbr);
         self.logger.info(&format!(
@@ -381,6 +399,153 @@ impl RawDiskFlasher {
         Ok(())
     }
 
+    /// The F101 route owns its verified address capability. All other media
+    /// continue through the existing raw implementation above, unchanged.
+    async fn execute_spinor_physical(&self, ctx: &libefex::Context) -> FlashResult<()> {
+        use crate::flash::f101_spinor::PreparedWrite;
+        use crate::process::StageType;
+        let convert = |error: anyhow::Error| {
+            FlashError::Unknown(format!("RAW_SPINOR_PHYSICAL_LAYOUT_UNVERIFIED:{error:#}"))
+        };
+        if self.request.mode != crate::flash::FlashMode::Partition {
+            return Err(FlashError::Unknown("RAW_SPINOR_REQUIRES_PARTITION_POLICY: chip erase is not part of the verified physical route".into()));
+        }
+        self.logger
+            .info("RAW_PREFLIGHT_STAGE:spinor_physical_backup");
+        let prepared = PreparedWrite::prepare(ctx, &self.image_path).map_err(convert)?;
+        let runtime_error = |error: anyhow::Error| {
+            FlashError::Unknown(format!("RAW_SPINOR_RUNTIME_CONTRACT_FAILED:{error:#}"))
+        };
+        self.logger
+            .info(&format!("RAW_SPINOR_CONTRACT:{}", prepared.description()));
+        self.logger.info(&format!(
+            "RAW_SPINOR_EVIDENCE:{}",
+            prepared.evidence_dir().display()
+        ));
+        self.logger.complete_stage();
+        ensure_not_cancelled()?;
+
+        // Preserve the single 16 KiB NOR MBR contract. Unlike the legacy
+        // shared path, this new route never retries a failed destructive step.
+        self.logger.begin_stage(StageType::FesErase);
+        prepared.check(ctx).map_err(runtime_error)?;
+        self.logger
+            .info("RAW_FES_ERASE_POLICY:mode=partition,flag=0x0");
+        let download_started = std::time::Instant::now();
+        self.logger
+            .info("RAW_SPINOR_FES_STEP:erase_policy_download:start,bytes=16,attempt=1");
+        let erase_policy = spinor_erase_policy_payload();
+        self.logger
+            .info("RAW_SPINOR_ERASE_POLICY_BUFFER:owned-writable,bytes=16");
+        ctx.fes_down(&erase_policy, 0, FesDataType::Erase)
+            .map_err(|error| {
+                FlashError::UsbTransferError(format!(
+                    "RAW_SPINOR_ERASE_POLICY_DOWNLOAD_FAILED:elapsedMs={},source={error:?}; policy confirmation, MBR, image write and requested post-action not run; no retry",
+                    download_started.elapsed().as_millis()
+                ))
+            })?;
+        self.logger.info(&format!(
+            "RAW_SPINOR_FES_STEP:erase_policy_download:success,elapsedMs={}",
+            download_started.elapsed().as_millis()
+        ));
+        let verify_started = std::time::Instant::now();
+        self.logger
+            .info("RAW_SPINOR_FES_STEP:erase_policy_verify:start,attempt=1");
+        let erase = ctx
+            .fes_verify_status(FesDataType::Erase as u32)
+            .map_err(|error| {
+                FlashError::UsbTransferError(format!(
+                    "RAW_SPINOR_ERASE_POLICY_VERIFY_FAILED:elapsedMs={},source={error:?}; policy download returned success, confirmation unavailable; MBR, image write and requested post-action not run; no retry",
+                    verify_started.elapsed().as_millis()
+                ))
+            })?;
+        self.logger.info(&format!(
+            "RAW_SPINOR_FES_STEP:erase_policy_verify:response,elapsedMs={},flag={:#x},mediaCrc={:#x}",
+            verify_started.elapsed().as_millis(), erase.flag, erase.media_crc
+        ));
+        if erase.flag != EFEX_CRC32_VALID_FLAG || erase.media_crc != 0 {
+            return Err(FlashError::Unknown(
+                "RAW_SPINOR_ERASE_POLICY_NOT_CONFIRMED".into(),
+            ));
+        }
+        self.logger.complete_stage();
+        ensure_not_cancelled()?;
+        self.logger.begin_stage(StageType::FesMbr);
+        let mbr = RawMode::SpinorPhysical
+            .layout(StorageType::Spinor)
+            .build_mbr(prepared.image_len() as u64 / SECTOR_SIZE)
+            .map_err(|error| FlashError::InvalidFirmwareFormat(error.to_owned()))?;
+        prepared.check(ctx).map_err(runtime_error)?;
+        self.logger
+            .info("RAW_MBR_GENERATED:copies=1,bytes=16384,startSector=0");
+        self.logger.info("RAW_MBR_DOWNLOAD_START");
+        MbrDownload::new(&self.logger)
+            .execute_once(ctx, &mbr)
+            .await?;
+        self.logger.info("RAW_MBR_DOWNLOAD_READY");
+        self.logger.complete_stage();
+        let access = FlashAccessGuard::enable(ctx, 3)?;
+        // MBR / flash-access setup must not have changed the active mapping.
+        prepared.check(ctx).map_err(runtime_error)?;
+        ensure_not_cancelled()?;
+        self.logger.begin_stage(StageType::FesPartitions);
+        self.logger.set_current_partition("SPI NOR physical");
+        self.logger
+            .set_partition_stage_weight(prepared.image_len() as u64);
+        self.logger
+            .info("RAW_WRITE_START:medium=spinor,physicalStart=0");
+        let write_result = prepared.write(
+            ctx,
+            || ensure_not_cancelled().map_err(anyhow::Error::new),
+            |done| {
+                self.logger.update_progress_with_speed(done as u64);
+            },
+        );
+        if let Err(error) = write_result {
+            self.logger.info(
+                "physicalVerifyState=not_run;postActionState=not_run;bootVerification=not_verified",
+            );
+            return Err(FlashError::Unknown(format!(
+                "RAW_SPINOR_WRITE_FAILED:{error:#}"
+            )));
+        }
+        self.logger.info("RAW_WRITE_COMPLETE:medium=spinor");
+        ensure_not_cancelled()?;
+        self.logger.info("RAW_SPINOR_PHYSICAL_VERIFY_START");
+        // Mandatory even when a caller disabled the legacy protocol CRC check.
+        let result = prepared.verify(ctx).map_err(|error| {
+            self.logger.verification("failed", None);
+            self.logger.info(
+                "physicalVerifyState=failed;postActionState=not_run;bootVerification=not_verified",
+            );
+            FlashError::Unknown(format!("RAW_SPINOR_PHYSICAL_VERIFY_FAILED:{error:#}"))
+        })?;
+        self.logger
+            .info(&format!("RAW_SPINOR_PHYSICAL_VERIFY_SUCCESS:{result}"));
+        self.logger.verification("success", Some(0));
+        self.logger
+            .info("verifyState=success;physicalVerifyState=success;bootVerification=not_verified");
+        self.logger.complete_stage();
+        access.disable()?;
+        ensure_not_cancelled()?;
+        self.logger.begin_stage(StageType::FesMode);
+        let post_result = self.apply_post_action(ctx);
+        self.logger.info(&format!(
+            "RAW_SPINOR_POST_ACTION:action={},state={},bootVerification=not_verified",
+            self.request.post_action,
+            if post_result.is_ok() {
+                "command_completed"
+            } else {
+                "failed"
+            }
+        ));
+        post_result?;
+        self.logger.complete_stage();
+        self.logger.flash_finished(self.request.post_action);
+        self.logger.finish_progress();
+        Ok(())
+    }
+
     fn open_device(&self) -> FlashResult<libefex::Context> {
         let mut ctx = libefex::Context::new();
         self.logger.info("RAW_PREFLIGHT_STAGE:scan_target");
@@ -415,11 +580,19 @@ impl RawDiskFlasher {
                 .post_action(PostAction::None, "skipped", 0, None);
             return Ok(());
         }
-        ctx.fes_tool_mode(
+        let result = ctx.fes_tool_mode(
             libefex::FesToolMode::Normal,
             self.request.post_action.fes_tool_mode(),
-        )
-        .map_err(|error| FlashError::UsbTransferError(error.to_string()))?;
+        );
+        if let Err(error) = result {
+            self.logger.post_action(
+                self.request.post_action,
+                "failed",
+                1,
+                Some(error.to_string()),
+            );
+            return Err(FlashError::UsbTransferError(error.to_string()));
+        }
         self.logger
             .post_action(self.request.post_action, "success", 1, None);
         Ok(())
@@ -453,6 +626,23 @@ impl RawDiskFlasher {
         );
         Ok(())
     }
+}
+
+// This is intentionally before capacity/erase/MBR/FlashAccess. The F101
+// loader has separate logical and physical NOR callbacks. FES Flash address 0
+// cannot be treated as physical 0. Do not add a guessed inverse offset here.
+fn validate_raw_address_contract(mode: RawMode, storage: StorageType) -> FlashResult<()> {
+    if mode == RawMode::SpinorPhysical && storage != StorageType::Spinor {
+        return Err(FlashError::InvalidFirmwareFormat(format!(
+            "RAW_SPINOR_STORAGE_MISMATCH: expected SPI NOR, detected {storage}"
+        )));
+    }
+    if storage == StorageType::Spinor {
+        return Err(FlashError::InvalidFirmwareFormat(
+            "RAW_SPINOR_PHYSICAL_LAYOUT_UNVERIFIED: SPI NOR physical read/write mapping and independent physical readback are not verified for this loader; refusing erase/MBR/image writes. No guessed offset is permitted.".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_emmc_storage(storage_type: StorageType) -> bool {
@@ -787,9 +977,55 @@ fn ensure_not_cancelled() -> FlashResult<()> {
     }
 }
 
+/// The Windows native libefex backend passes this buffer to METHOD_OUT_DIRECT.
+/// Windows probes it for write access even though the payload goes to the board.
+/// A promoted `&[0; 16]` lives in read-only memory; retain owned, writable storage
+/// through the synchronous transfer, as the existing EraseFlag handler does.
+fn spinor_erase_policy_payload() -> Vec<u8> {
+    vec![0; 16]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinor_policy_preserves_partition_flag_and_wire_bytes() {
+        assert_eq!(spinor_erase_policy_payload(), vec![0u8; 16]);
+        assert_eq!(crate::flash::FlashMode::Partition.erase_flag(), 0);
+    }
+
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn spinor_policy_buffer_satisfies_windows_direct_io_write_access() {
+        use std::ffi::c_void;
+        #[repr(C)]
+        #[derive(Default)]
+        struct MemoryInfo {
+            base: *mut c_void,
+            allocation_base: *mut c_void,
+            allocation_protect: u32,
+            partition_id: u16,
+            region_size: usize,
+            state: u32,
+            protect: u32,
+            kind: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn VirtualQuery(address: *const c_void, info: *mut MemoryInfo, size: usize) -> usize;
+        }
+        let payload = spinor_erase_policy_payload();
+        let mut info = MemoryInfo::default();
+        // Query only our process's allocation. No USB/driver/device is opened.
+        let queried =
+            unsafe { VirtualQuery(payload.as_ptr().cast(), &mut info, size_of::<MemoryInfo>()) };
+        assert_eq!(queried, size_of::<MemoryInfo>());
+        assert_eq!(info.state, 0x1000); // MEM_COMMIT
+        assert_eq!(info.protect, 0x04); // PAGE_READWRITE, no guard/no-access
+        let end = payload.as_ptr() as usize + payload.len();
+        assert!(end <= info.base as usize + info.region_size);
+    }
 
     #[test]
     fn command_raw_contract_is_sector_aligned_and_starts_at_disk_zero() {
@@ -808,6 +1044,46 @@ mod tests {
         assert!(!spinor_layout.wrapping_address);
         assert_eq!(RAW_READ_WINDOW_SIZE, 10 * 1024 * 1024);
         assert_eq!(RAW_READ_WINDOW_SIZE % SECTOR_SIZE as usize, 0);
+    }
+
+    #[test]
+    fn spinor_mbr_uses_the_loader_single_record_contract() {
+        let layout = RawMode::Command.layout(StorageType::Spinor);
+        assert_eq!(layout.copies, 1, "F101 NOR loader requires one 16 KiB MBR");
+        let bytes = layout.build_mbr(9552).unwrap();
+        assert_eq!(bytes.len(), 16_384);
+        let mbr = crate::config::mbr_parser::SunxiMbr::parse(&bytes).unwrap();
+        assert_eq!((mbr.copy, mbr.index), (1, 0));
+        assert_eq!(mbr.partitions[0].address(), 0);
+        assert_eq!(mbr.partitions[0].length(), 9552);
+    }
+
+    #[test]
+    fn other_raw_media_retain_four_records_and_existing_offsets() {
+        for storage in [
+            StorageType::Emmc,
+            StorageType::Emmc3,
+            StorageType::Emmc0,
+            StorageType::Sdcard,
+            StorageType::Sd1,
+            StorageType::Ufs,
+        ] {
+            let layout = RawMode::Command.layout(storage);
+            let bytes = layout.build_mbr(9552).unwrap();
+            assert_eq!(bytes.len(), 65_536);
+            let expected_start = if storage == StorageType::Ufs {
+                0
+            } else {
+                0xffff_6000
+            };
+            assert_eq!(layout.start_sector, expected_start);
+            assert_eq!(RawMode::physical_start_sector(layout), 0);
+            for (index, record) in bytes.chunks_exact(16_384).enumerate() {
+                let mbr = crate::config::mbr_parser::SunxiMbr::parse(record).unwrap();
+                assert_eq!((mbr.copy, mbr.index), (4, index as u32));
+                assert_eq!(mbr.partitions[0].address(), expected_start);
+            }
+        }
     }
 
     #[test]
@@ -986,5 +1262,43 @@ mod tests {
             fes_status_label(&libefex::EfexError::UsbTransfer),
             "transport_or_invalid_csw"
         );
+    }
+    #[test]
+    fn spinor_unproven_address_mapping_is_rejected_in_both_raw_routes() {
+        for mode in [RawMode::Command, RawMode::SpinorPhysical] {
+            let error = validate_raw_address_contract(mode, StorageType::Spinor).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("RAW_SPINOR_PHYSICAL_LAYOUT_UNVERIFIED"));
+            // Preserve the independently validated single-copy MBR builder.
+            assert_eq!(
+                mode.layout(StorageType::Spinor)
+                    .build_mbr(9552)
+                    .unwrap()
+                    .len(),
+                16 * 1024
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_spinor_route_rejects_other_media_without_altering_command_route() {
+        for storage in [
+            StorageType::Emmc,
+            StorageType::Emmc0,
+            StorageType::Emmc3,
+            StorageType::Sdcard,
+            StorageType::Sd1,
+            StorageType::Nand,
+            StorageType::Spinand,
+        ] {
+            assert!(
+                validate_raw_address_contract(RawMode::SpinorPhysical, storage)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("RAW_SPINOR_STORAGE_MISMATCH")
+            );
+            assert!(validate_raw_address_contract(RawMode::Command, storage).is_ok());
+        }
     }
 }

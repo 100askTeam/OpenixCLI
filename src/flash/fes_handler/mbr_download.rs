@@ -64,6 +64,16 @@ impl<'a> MbrDownload<'a> {
     }
 
     /// Verify MBR was written correctly
+    pub async fn execute_once(&self, ctx: &libefex::Context, mbr_data: &[u8]) -> FlashResult<()> {
+        if !is_valid_mbr(mbr_data) {
+            return Err(FlashError::InvalidFirmwareFormat("Invalid MBR".to_owned()));
+        }
+        ctx.fes_down(mbr_data, 0, FesDataType::Mbr)
+            .map_err(|error| FlashError::UsbTransferError(error.to_string()))?;
+        self.verify_mbr(ctx).await
+    }
+
+    /// Verify MBR was written correctly
     async fn verify_mbr(&self, ctx: &libefex::Context) -> FlashResult<()> {
         for _ in 0..MAX_VERIFY_RETRIES {
             tokio::time::sleep(Duration::from_millis(100)).await;

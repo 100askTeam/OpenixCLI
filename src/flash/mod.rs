@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod events;
+pub(crate) mod f101_spinor;
 pub mod fel_handler;
 pub mod fes_handler;
 mod raw_disk;
